@@ -3,6 +3,9 @@
 /bin/
 /dist/
 
+# Local Codex/Superpowers planning docs
+/docs/superpowers/
+
 # Go test and coverage artifacts
 *.test
 coverage.out
