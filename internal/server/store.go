@@ -4,14 +4,21 @@ import (
 	"io"
 	"sort"
 	"sync"
+	"time"
 )
 
 type Runner interface {
 	Run(command string) (RunResult, error)
 	RunIdle(command string) (RunResult, error)
 	Send(input string) error
+	SendWait(input string, quietFor time.Duration) (RunResult, error)
 	SendFollow(input string, output io.Writer, done <-chan struct{}) error
+	Command(keys string) error
+	CommandWait(keys string, quietFor time.Duration) (RunResult, error)
+	CommandFollow(keys string, output io.Writer, done <-chan struct{}) error
+	Follow(output io.Writer, done <-chan struct{}) error
 	CtrlCFollow(output io.Writer, done <-chan struct{}) error
+	Read(count int) (RunResult, error)
 	Close() error
 }
 

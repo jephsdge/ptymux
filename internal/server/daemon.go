@@ -60,7 +60,13 @@ func (d *Daemon) handle(conn net.Conn) {
 		_ = json.NewEncoder(conn).Encode(Response{Error: err.Error()})
 		return
 	}
-	if req.Action == "send" || req.Action == "ctrl-c" {
+	if req.Action == "follow" || req.Action == "ctrl-c" || (req.Action == "send" && req.Follow) || (req.Action == "command" && req.Follow) {
+		if req.Action == "command" {
+			if _, err := parseKeySequence(req.Command); err != nil {
+				_ = json.NewEncoder(conn).Encode(Response{Error: err.Error()})
+				return
+			}
+		}
 		d.handleStream(conn, req)
 		return
 	}
@@ -84,9 +90,14 @@ func (d *Daemon) handleStream(conn net.Conn, req Request) {
 		return runner
 	})
 	var err error
-	if req.Action == "ctrl-c" {
+	switch req.Action {
+	case "ctrl-c":
 		err = tab.Runner.CtrlCFollow(conn, done)
-	} else {
+	case "follow":
+		err = tab.Runner.Follow(conn, done)
+	case "command":
+		err = tab.Runner.CommandFollow(req.Command, conn, done)
+	default:
 		err = tab.Runner.SendFollow(req.Command, conn, done)
 	}
 	if err != nil {
@@ -117,7 +128,11 @@ func (d *Daemon) Handle(req Request) Response {
 			}
 			return runner
 		})
-		result, err := tab.Runner.RunIdle(req.Command)
+		wait := time.Duration(req.WaitMillis) * time.Millisecond
+		if wait <= 0 {
+			wait = 500 * time.Millisecond
+		}
+		result, err := tab.Runner.SendWait(req.Command, wait)
 		if err != nil {
 			return Response{Error: err.Error()}
 		}
@@ -130,10 +145,49 @@ func (d *Daemon) Handle(req Request) Response {
 			}
 			return runner
 		})
+		if req.WaitMillis > 0 {
+			result, err := tab.Runner.SendWait(req.Command, time.Duration(req.WaitMillis)*time.Millisecond)
+			if err != nil {
+				return Response{Error: err.Error()}
+			}
+			return Response{Output: result.Output, ExitCode: result.ExitCode}
+		}
 		if err := tab.Runner.Send(req.Command); err != nil {
 			return Response{Error: err.Error()}
 		}
 		return Response{}
+	case "command":
+		tab := d.store.GetOrCreate(req.Session, req.Pane, req.Tab, func() Runner {
+			runner, err := NewPTYRunner(d.shell)
+			if err != nil {
+				return &errorRunner{err: err}
+			}
+			return runner
+		})
+		if req.WaitMillis > 0 {
+			result, err := tab.Runner.CommandWait(req.Command, time.Duration(req.WaitMillis)*time.Millisecond)
+			if err != nil {
+				return Response{Error: err.Error()}
+			}
+			return Response{Output: result.Output, ExitCode: result.ExitCode}
+		}
+		if err := tab.Runner.Command(req.Command); err != nil {
+			return Response{Error: err.Error()}
+		}
+		return Response{}
+	case "read":
+		tab := d.store.GetOrCreate(req.Session, req.Pane, req.Tab, func() Runner {
+			runner, err := NewPTYRunner(d.shell)
+			if err != nil {
+				return &errorRunner{err: err}
+			}
+			return runner
+		})
+		result, err := tab.Runner.Read(req.ReadCount)
+		if err != nil {
+			return Response{Error: err.Error()}
+		}
+		return Response{Output: result.Output, ExitCode: result.ExitCode}
 	case "list":
 		return Response{Snapshot: d.store.SnapshotTarget(req.Session, req.Pane, req.Tab)}
 	case "kill":
@@ -182,10 +236,26 @@ func (r *errorRunner) RunIdle(string) (RunResult, error) {
 	return RunResult{}, r.err
 }
 func (r *errorRunner) Send(string) error { return r.err }
+func (r *errorRunner) SendWait(string, time.Duration) (RunResult, error) {
+	return RunResult{}, r.err
+}
 func (r *errorRunner) SendFollow(string, io.Writer, <-chan struct{}) error {
+	return r.err
+}
+func (r *errorRunner) Command(string) error { return r.err }
+func (r *errorRunner) CommandWait(string, time.Duration) (RunResult, error) {
+	return RunResult{}, r.err
+}
+func (r *errorRunner) CommandFollow(string, io.Writer, <-chan struct{}) error {
+	return r.err
+}
+func (r *errorRunner) Follow(io.Writer, <-chan struct{}) error {
 	return r.err
 }
 func (r *errorRunner) CtrlCFollow(io.Writer, <-chan struct{}) error {
 	return r.err
+}
+func (r *errorRunner) Read(int) (RunResult, error) {
+	return RunResult{}, r.err
 }
 func (r *errorRunner) Close() error { return nil }

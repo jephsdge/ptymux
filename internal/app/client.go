@@ -31,14 +31,17 @@ func Run(cfg Config) (server.Response, error) {
 	}
 
 	req := server.Request{
-		Action:  string(cfg.Action),
-		Session: cfg.Session,
-		Pane:    cfg.Pane,
-		Tab:     cfg.Tab,
-		Command: cfg.Command,
+		Action:     string(cfg.Action),
+		Session:    cfg.Session,
+		Pane:       cfg.Pane,
+		Tab:        cfg.Tab,
+		Command:    cfg.Command,
+		Follow:     cfg.Follow,
+		WaitMillis: int64(cfg.Wait / time.Millisecond),
+		ReadCount:  cfg.ReadCount,
 	}
 
-	if cfg.Action == ActionSend || cfg.Action == ActionCtrlC {
+	if cfg.Action == ActionFollow || cfg.Action == ActionCtrlC || (cfg.Action == ActionSend && cfg.Follow) || (cfg.Action == ActionCommand && cfg.Follow) {
 		if err := streamSend(socketPath, req, os.Stdout); err != nil {
 			if startErr := startDaemon(socketPath); startErr != nil {
 				return server.Response{}, fmt.Errorf("%v; also failed to start daemon: %w", err, startErr)

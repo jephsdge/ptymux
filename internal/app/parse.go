@@ -5,28 +5,35 @@ import (
 	"flag"
 	"fmt"
 	"strings"
+	"time"
 )
 
 type Action string
 
 const (
-	ActionRun    Action = "run"
-	ActionDaemon Action = "daemon"
-	ActionList   Action = "list"
-	ActionKill   Action = "kill"
-	ActionStop   Action = "stop"
-	ActionIdle   Action = "idle"
-	ActionSend   Action = "send"
-	ActionCtrlC  Action = "ctrl-c"
+	ActionRun     Action = "run"
+	ActionDaemon  Action = "daemon"
+	ActionList    Action = "list"
+	ActionKill    Action = "kill"
+	ActionStop    Action = "stop"
+	ActionIdle    Action = "idle"
+	ActionSend    Action = "send"
+	ActionCommand Action = "command"
+	ActionCtrlC   Action = "ctrl-c"
+	ActionRead    Action = "read"
+	ActionFollow  Action = "follow"
 )
 
 type Config struct {
-	Action  Action
-	Session string
-	Pane    string
-	Tab     string
-	Command string
-	Socket  string
+	Action    Action
+	Session   string
+	Pane      string
+	Tab       string
+	Command   string
+	Socket    string
+	Follow    bool
+	Wait      time.Duration
+	ReadCount int
 }
 
 func Parse(args []string) (Config, error) {
@@ -57,10 +64,34 @@ func Parse(args []string) (Config, error) {
 		case "send":
 			cfg.Action = ActionSend
 			args = args[1:]
+		case "command":
+			cfg.Action = ActionCommand
+			args = args[1:]
 		case "ctrl-c":
 			cfg.Action = ActionCtrlC
 			args = args[1:]
+		case "read":
+			cfg.Action = ActionRead
+			args = args[1:]
+		case "follow":
+			cfg.Action = ActionFollow
+			args = args[1:]
 		}
+	}
+
+	switch cfg.Action {
+	case ActionSend:
+		return parseSend(cfg, args)
+	case ActionCommand:
+		return parseCommand(cfg, args)
+	case ActionIdle:
+		return parseIdle(cfg, args)
+	case ActionRead:
+		return parseRead(cfg, args)
+	case ActionFollow:
+		return parseFollow(cfg, args)
+	case ActionCtrlC:
+		return parseTargetAction(cfg, args, "ctrl-c")
 	}
 
 	fs := flag.NewFlagSet("ptymux", flag.ContinueOnError)
@@ -112,15 +143,27 @@ func Parse(args []string) (Config, error) {
 		case "idle":
 			cfg.Action = ActionIdle
 			rest = rest[1:]
-			return applyCommandTarget(&cfg, rest, "idle")
+			return parseIdle(cfg, rest)
 		case "send":
 			cfg.Action = ActionSend
 			rest = rest[1:]
-			return applyCommandTarget(&cfg, rest, "send")
+			return parseSend(cfg, rest)
+		case "command":
+			cfg.Action = ActionCommand
+			rest = rest[1:]
+			return parseCommand(cfg, rest)
 		case "ctrl-c":
 			cfg.Action = ActionCtrlC
 			rest = rest[1:]
 			return applyTargetOnly(&cfg, rest, "ctrl-c")
+		case "read":
+			cfg.Action = ActionRead
+			rest = rest[1:]
+			return parseRead(cfg, rest)
+		case "follow":
+			cfg.Action = ActionFollow
+			rest = rest[1:]
+			return parseFollow(cfg, rest)
 		}
 	}
 
@@ -152,21 +195,137 @@ func Parse(args []string) (Config, error) {
 	}
 
 	if cfg.Action == ActionIdle {
-		return applyCommandTarget(&cfg, rest, "idle")
+		return parseIdle(cfg, rest)
 	}
 
 	if cfg.Action == ActionSend {
-		return applyCommandTarget(&cfg, rest, "send")
+		return parseSend(cfg, rest)
+	}
+
+	if cfg.Action == ActionCommand {
+		return parseCommand(cfg, rest)
 	}
 
 	if cfg.Action == ActionCtrlC {
 		return applyTargetOnly(&cfg, rest, "ctrl-c")
 	}
 
+	if cfg.Action == ActionRead {
+		return parseRead(cfg, rest)
+	}
+
+	if cfg.Action == ActionFollow {
+		return parseFollow(cfg, rest)
+	}
+
 	if len(rest) != 0 {
 		return Config{}, fmt.Errorf("%s does not accept positional arguments", cfg.Action)
 	}
 	return cfg, nil
+}
+
+func parseSend(cfg Config, args []string) (Config, error) {
+	fs := flag.NewFlagSet("send", flag.ContinueOnError)
+	var waitValue string
+	registerSocketFlag(fs, &cfg)
+	fs.BoolVar(&cfg.Follow, "f", false, "follow output until interrupted")
+	fs.StringVar(&waitValue, "t", "", "wait until PTY output is quiet for this duration")
+	if err := fs.Parse(args); err != nil {
+		return Config{}, err
+	}
+	if cfg.Follow && waitValue != "" {
+		return Config{}, errors.New("send -f and -t cannot be used together")
+	}
+	if waitValue != "" {
+		wait, err := parseWait(waitValue)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.Wait = wait
+	}
+	return applyCommandTarget(&cfg, fs.Args(), "send")
+}
+
+func parseCommand(cfg Config, args []string) (Config, error) {
+	fs := flag.NewFlagSet("command", flag.ContinueOnError)
+	var waitValue string
+	registerSocketFlag(fs, &cfg)
+	fs.BoolVar(&cfg.Follow, "f", false, "follow output until interrupted")
+	fs.StringVar(&waitValue, "t", "", "wait until PTY output is quiet for this duration")
+	if err := fs.Parse(args); err != nil {
+		return Config{}, err
+	}
+	if cfg.Follow && waitValue != "" {
+		return Config{}, errors.New("command -f and -t cannot be used together")
+	}
+	if waitValue != "" {
+		wait, err := parseWait(waitValue)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.Wait = wait
+	}
+	return applyCommandTarget(&cfg, fs.Args(), "command")
+}
+
+func parseIdle(cfg Config, args []string) (Config, error) {
+	fs := flag.NewFlagSet("idle", flag.ContinueOnError)
+	waitValue := "500ms"
+	registerSocketFlag(fs, &cfg)
+	fs.StringVar(&waitValue, "t", waitValue, "wait until PTY output is quiet for this duration")
+	if err := fs.Parse(args); err != nil {
+		return Config{}, err
+	}
+	wait, err := parseWait(waitValue)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.Wait = wait
+	return applyCommandTarget(&cfg, fs.Args(), "idle")
+}
+
+func parseRead(cfg Config, args []string) (Config, error) {
+	fs := flag.NewFlagSet("read", flag.ContinueOnError)
+	fs.IntVar(&cfg.ReadCount, "n", 0, "number of recent command transcript entries to read")
+	if err := fs.Parse(args); err != nil {
+		return Config{}, err
+	}
+	return applyTargetOnly(&cfg, fs.Args(), "read")
+}
+
+func parseFollow(cfg Config, args []string) (Config, error) {
+	cfg.Follow = true
+	return applyTargetOnly(&cfg, args, "follow")
+}
+
+func parseTargetAction(cfg Config, args []string, action string) (Config, error) {
+	fs := flag.NewFlagSet(action, flag.ContinueOnError)
+	registerSocketFlag(fs, &cfg)
+	if err := fs.Parse(args); err != nil {
+		return Config{}, err
+	}
+	return applyTargetOnly(&cfg, fs.Args(), action)
+}
+
+func registerSocketFlag(fs *flag.FlagSet, cfg *Config) {
+	fs.StringVar(&cfg.Socket, "socket", cfg.Socket, "daemon socket path")
+}
+
+func parseWait(value string) (time.Duration, error) {
+	if value == "" {
+		return 0, nil
+	}
+	if value[len(value)-1] >= '0' && value[len(value)-1] <= '9' {
+		value += "ms"
+	}
+	wait, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("invalid duration %q: %w", value, err)
+	}
+	if wait <= 0 {
+		return 0, fmt.Errorf("duration must be positive: %s", value)
+	}
+	return wait, nil
 }
 
 func applyTargetOnly(cfg *Config, rest []string, action string) (Config, error) {

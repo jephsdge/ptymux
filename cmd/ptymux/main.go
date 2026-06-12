@@ -22,13 +22,13 @@ func main() {
 	}
 
 	switch cfg.Action {
-	case app.ActionRun, app.ActionIdle:
+	case app.ActionRun, app.ActionIdle, app.ActionSend, app.ActionCommand, app.ActionRead:
 		fmt.Print(resp.Output)
 		if resp.Output != "" && resp.Output[len(resp.Output)-1] != '\n' {
 			fmt.Println()
 		}
 		os.Exit(resp.ExitCode)
-	case app.ActionSend, app.ActionCtrlC:
+	case app.ActionCtrlC, app.ActionFollow:
 		os.Exit(resp.ExitCode)
 	case app.ActionList:
 		printList(resp.Snapshot)

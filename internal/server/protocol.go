@@ -1,11 +1,14 @@
 package server
 
 type Request struct {
-	Action  string `json:"action"`
-	Session string `json:"session,omitempty"`
-	Pane    string `json:"pane,omitempty"`
-	Tab     string `json:"tab,omitempty"`
-	Command string `json:"command,omitempty"`
+	Action     string `json:"action"`
+	Session    string `json:"session,omitempty"`
+	Pane       string `json:"pane,omitempty"`
+	Tab        string `json:"tab,omitempty"`
+	Command    string `json:"command,omitempty"`
+	Follow     bool   `json:"follow,omitempty"`
+	WaitMillis int64  `json:"wait_millis,omitempty"`
+	ReadCount  int    `json:"read_count,omitempty"`
 }
 
 type Response struct {

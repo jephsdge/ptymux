@@ -100,23 +100,44 @@ ptymux work "pwd"
 ptymux idle work "exit"
 ```
 
-Idle 模式不会追加 marker。它发送命令后等待 PTY 输出安静一小段时间，然后返回。
+Idle 模式不会追加 marker。它发送命令后等待 PTY 输出安静 500ms，然后返回。
+它等价于 `send -t 500ms`。
 
 Idle 是启发式判断。像 `sleep 2 && echo done` 这种延迟输出命令，可能会在所有
 输出到达前提前返回。
 
 ### Send 模式
 
-`send` 用于向 target 写入输入，然后跟随输出：
+`send` 用于向 target 写入输入，并且不追加完成 marker：
 
 ```sh
 ptymux send work "ls"
 ```
 
-`send` 不追加 marker。它会持续流式输出，直到你用 `Ctrl+C` 停止当前客户端；
-target 本身会继续运行。
+默认情况下，`send` 会写入输入并直接返回，不打印输出。后台 reader 会继续维护
+终端状态和命令历史。
 
-当 target 位于交互程序或远端 shell 中、marker 不可靠时，这个模式很有用。
+发送后跟随输出：
+
+```sh
+ptymux send -f work "ls"
+```
+
+`send -f` 会持续流式输出，直到你用 `Ctrl+C` 停止当前客户端；target 本身会
+继续运行。
+
+等待输出静默后返回新增输出：
+
+```sh
+ptymux send -t 100 work "ls"   # 100ms
+ptymux send -t 1s work "ls"    # 1 秒
+ptymux send -t 1m work "ls"    # 1 分钟
+ptymux send -t 1ms work "ls"   # 1 毫秒
+```
+
+没有单位的 duration 会按毫秒解释。`-f` 和 `-t` 互斥，不能同时使用。
+
+当 target 位于交互程序或远端 shell 中、marker 不可靠时，`send` 很有用。
 例如 SSH 密码提示之后：
 
 ```sh
@@ -125,6 +146,25 @@ ptymux send work "your-password"
 
 对于 SSH 密码，优先使用 SSH key 或 agent。不要长期把密码直接写在命令参数里，
 因为它可能进入 shell history，或者短暂出现在进程参数中。
+
+### Command 模式
+
+`command` 用于发送终端按键序列：
+
+```sh
+ptymux command work "ctrl-c"
+ptymux command work "ctrl-o d"
+ptymux command -t 500ms work "ctrl-c"
+ptymux command -f work "ctrl-o d"
+```
+
+空格表示先后按，`-` 表示组合键。ptymux 会在按键序列结束后自动追加 Enter。
+例如 `ctrl-o d` 会发送 Ctrl+O，然后发送 `d`，然后发送 Enter。
+
+支持的命名按键包括 `enter`、`esc`、`escape`、`tab`、`backspace` 和 `space`。
+`-f` 和 `-t` 的行为与 `send` 一样：持续 follow，或等待输出静默指定时间。
+
+新用法推荐 `command`。旧的 `ctrl-c` 命令作为兼容别名保留。
 
 ### Ctrl+C
 
@@ -136,6 +176,34 @@ ptymux ctrl-c work
 
 这会向目标 PTY 写入 ETX 字节，也就是 `0x03`，然后像 `send` 一样跟随输出。
 用 `Ctrl+C` 停止观察；target 仍然保留。
+
+### Read 模式
+
+读取当前终端屏幕：
+
+```sh
+ptymux read work
+```
+
+读取最近几条命令 transcript：
+
+```sh
+ptymux read -n 3 work
+```
+
+返回顺序是在所选最近窗口内从旧到新。
+`read` 是只读操作，不会阻塞其他客户端中的命令。
+
+### Follow 模式
+
+不发送输入，只持续流式输出后续 PTY 内容：
+
+```sh
+ptymux follow work
+```
+
+用 `Ctrl+C` 停止观察；target 仍然保留。
+`follow` 是只读订阅，只观察后续输出，不会锁住 target。
 
 ## 查看 Targets
 
@@ -184,7 +252,7 @@ ptymux --socket /tmp/project-a.sock stop
 
 - 每个完整 target 路径对应一个长期存活的 `/bin/sh` 进程，并连接到一个 PTY。
 - PTY 输出会像真实终端一样合并 stdout/stderr。
-- `send` 和 `ctrl-c` 会持续输出，直到客户端断开。
+- `send -f`、`follow` 和 `ctrl-c` 会持续输出，直到客户端断开。
 - 目前还没有完整 attach 模式；输入仍然是一条命令一条命令发送。
 
 ## License
