@@ -35,16 +35,37 @@ Targets are created lazily. The first command for a target creates its backing
 Build a static binary:
 
 ```sh
-CGO_ENABLED=0 go build -o ptymux ./cmd/ptymux
+./scripts/build.sh
+```
+
+The default output is `dist/ptymux` for Linux amd64 with `CGO_ENABLED=0`.
+
+You can override the target:
+
+```sh
+GOOS=linux GOARCH=arm64 ./scripts/build.sh
+OUT_DIR=. BIN_NAME=ptymux CGO_ENABLED=0 ./scripts/build.sh
+```
+
+Manual equivalent:
+
+```sh
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/ptymux ./cmd/ptymux
 ```
 
 Optionally move it somewhere on your `PATH`:
 
 ```sh
-install -m 0755 ptymux ~/.local/bin/ptymux
+install -m 0755 dist/ptymux ~/.local/bin/ptymux
 ```
 
 ## Basic Usage
+
+Show CLI help:
+
+```sh
+ptymux -h
+```
 
 Run commands in a persistent target:
 

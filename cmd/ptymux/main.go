@@ -14,6 +14,10 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
+	if cfg.Action == app.ActionHelp {
+		fmt.Print(app.HelpText())
+		return
+	}
 
 	resp, err := app.Run(cfg)
 	if err != nil {

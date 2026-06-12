@@ -12,6 +12,7 @@ type Action string
 
 const (
 	ActionRun     Action = "run"
+	ActionHelp    Action = "help"
 	ActionDaemon  Action = "daemon"
 	ActionList    Action = "list"
 	ActionKill    Action = "kill"
@@ -44,8 +45,16 @@ func Parse(args []string) (Config, error) {
 		Tab:     "default",
 	}
 
+	if len(args) > 0 && isHelpArg(args[0]) {
+		cfg.Action = ActionHelp
+		return cfg, nil
+	}
+
 	if len(args) > 0 {
 		switch args[0] {
+		case "help":
+			cfg.Action = ActionHelp
+			args = args[1:]
 		case "daemon":
 			cfg.Action = ActionDaemon
 			args = args[1:]
@@ -80,6 +89,8 @@ func Parse(args []string) (Config, error) {
 	}
 
 	switch cfg.Action {
+	case ActionHelp:
+		return cfg, nil
 	case ActionSend:
 		return parseSend(cfg, args)
 	case ActionCommand:
@@ -225,6 +236,10 @@ func Parse(args []string) (Config, error) {
 }
 
 func parseSend(cfg Config, args []string) (Config, error) {
+	if hasHelpArg(args) {
+		cfg.Action = ActionHelp
+		return cfg, nil
+	}
 	fs := flag.NewFlagSet("send", flag.ContinueOnError)
 	var waitValue string
 	registerSocketFlag(fs, &cfg)
@@ -247,6 +262,10 @@ func parseSend(cfg Config, args []string) (Config, error) {
 }
 
 func parseCommand(cfg Config, args []string) (Config, error) {
+	if hasHelpArg(args) {
+		cfg.Action = ActionHelp
+		return cfg, nil
+	}
 	fs := flag.NewFlagSet("command", flag.ContinueOnError)
 	var waitValue string
 	registerSocketFlag(fs, &cfg)
@@ -269,6 +288,10 @@ func parseCommand(cfg Config, args []string) (Config, error) {
 }
 
 func parseIdle(cfg Config, args []string) (Config, error) {
+	if hasHelpArg(args) {
+		cfg.Action = ActionHelp
+		return cfg, nil
+	}
 	fs := flag.NewFlagSet("idle", flag.ContinueOnError)
 	waitValue := "500ms"
 	registerSocketFlag(fs, &cfg)
@@ -285,6 +308,10 @@ func parseIdle(cfg Config, args []string) (Config, error) {
 }
 
 func parseRead(cfg Config, args []string) (Config, error) {
+	if hasHelpArg(args) {
+		cfg.Action = ActionHelp
+		return cfg, nil
+	}
 	fs := flag.NewFlagSet("read", flag.ContinueOnError)
 	fs.IntVar(&cfg.ReadCount, "n", 0, "number of recent command transcript entries to read")
 	if err := fs.Parse(args); err != nil {
@@ -294,11 +321,19 @@ func parseRead(cfg Config, args []string) (Config, error) {
 }
 
 func parseFollow(cfg Config, args []string) (Config, error) {
+	if hasHelpArg(args) {
+		cfg.Action = ActionHelp
+		return cfg, nil
+	}
 	cfg.Follow = true
 	return applyTargetOnly(&cfg, args, "follow")
 }
 
 func parseTargetAction(cfg Config, args []string, action string) (Config, error) {
+	if hasHelpArg(args) {
+		cfg.Action = ActionHelp
+		return cfg, nil
+	}
 	fs := flag.NewFlagSet(action, flag.ContinueOnError)
 	registerSocketFlag(fs, &cfg)
 	if err := fs.Parse(args); err != nil {
@@ -309,6 +344,55 @@ func parseTargetAction(cfg Config, args []string, action string) (Config, error)
 
 func registerSocketFlag(fs *flag.FlagSet, cfg *Config) {
 	fs.StringVar(&cfg.Socket, "socket", cfg.Socket, "daemon socket path")
+}
+
+func isHelpArg(arg string) bool {
+	return arg == "-h" || arg == "--help"
+}
+
+func hasHelpArg(args []string) bool {
+	for _, arg := range args {
+		if isHelpArg(arg) {
+			return true
+		}
+	}
+	return false
+}
+
+func HelpText() string {
+	return strings.TrimLeft(`
+ptymux - persistent command-line PTY targets
+
+Usage:
+  ptymux [--socket PATH] <target> <command>
+  ptymux idle [-t DURATION] [--socket PATH] <target> <input>
+  ptymux send [-f | -t DURATION] [--socket PATH] <target> <input>
+  ptymux command [-f | -t DURATION] [--socket PATH] <target> <keys>
+  ptymux read [-n N] <target>
+  ptymux follow <target>
+  ptymux list [target]
+  ptymux stop
+  ptymux -h | --help | help
+
+Targets:
+  work             -> work/default/default
+  work/main        -> work/main/default
+  work/main/build  -> work/main/build
+
+Examples:
+  ptymux work "pwd"
+  ptymux work "cd /tmp"
+  ptymux send -t 500ms work "pwd"
+  ptymux command work "ctrl-c"
+  ptymux read -n 3 work
+  ptymux follow work
+
+Options:
+  --socket PATH    use a custom daemon socket
+  -f               follow output until interrupted
+  -t DURATION      wait until PTY output is quiet; bare numbers are ms
+  -n N             read the recent N terminal command regions
+`, "\n")
 }
 
 func parseWait(value string) (time.Duration, error) {

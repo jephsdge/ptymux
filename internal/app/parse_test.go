@@ -1,6 +1,7 @@
 package app
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -25,6 +26,28 @@ func TestParseRunCommand(t *testing.T) {
 	}
 	if cfg.Command != "pwd" {
 		t.Fatalf("Command = %q, want pwd", cfg.Command)
+	}
+}
+
+func TestParseHelpFlags(t *testing.T) {
+	tests := [][]string{
+		{"-h"},
+		{"--help"},
+		{"help"},
+		{"send", "-h"},
+		{"read", "--help"},
+	}
+
+	for _, args := range tests {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			cfg, err := Parse(args)
+			if err != nil {
+				t.Fatalf("Parse returned error: %v", err)
+			}
+			if cfg.Action != ActionHelp {
+				t.Fatalf("Action = %q, want %q", cfg.Action, ActionHelp)
+			}
+		})
 	}
 }
 
