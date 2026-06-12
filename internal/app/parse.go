@@ -134,6 +134,7 @@ func Parse(args []string) (Config, error) {
 }
 
 func applyTarget(cfg *Config, target string, partial bool) error {
+	// Public targets are paths. Internally they map to session/pane/tab.
 	parts := strings.Split(target, "/")
 	if len(parts) > 3 {
 		return fmt.Errorf("invalid target %q", target)

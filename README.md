@@ -4,10 +4,12 @@
 processes behind named targets, so repeated commands can share shell state such
 as the current directory and exported environment variables.
 
-Each target is addressed as:
+A target is a path with up to three parts:
 
 ```text
-session/pane/tab
+name
+name/group
+name/group/shell
 ```
 
 Shorter forms are allowed:
@@ -17,6 +19,9 @@ work             -> work/default/default
 work/main        -> work/main/default
 work/main/build  -> work/main/build
 ```
+
+Internally, those three parts map to `session`, `pane`, and `tab`. The CLI uses
+`target` as the public concept so day-to-day commands stay simple.
 
 ## Install
 
@@ -55,24 +60,24 @@ ptymux work/main/build "go test ./..."
 ptymux work/main/shell "pwd"
 ```
 
-Targets are created lazily. The first command for a target creates its session,
-pane, tab, shell, and PTY automatically.
+Targets are created lazily. The first command for a target creates its backing
+shell and PTY automatically.
 
 ## Listing Targets
 
-List all sessions, panes, and tabs:
+List all targets:
 
 ```sh
 ptymux list
 ```
 
-List panes in a session:
+List child groups under a target:
 
 ```sh
 ptymux list work
 ```
 
-List tabs in a pane:
+List shells under a target group:
 
 ```sh
 ptymux list work/main
@@ -104,7 +109,8 @@ ptymux --socket /tmp/project-a.sock stop
 
 ## Notes
 
-- Each tab is a long-lived `/bin/sh` process attached to a PTY.
+- Each full target path resolves to a long-lived `/bin/sh` process attached to a
+  PTY.
 - Output from stdout and stderr is combined, like a normal terminal.
 - Interactive full-screen programs such as `vim`, `top`, and `ssh` are not a
   goal for the synchronous command mode yet.
