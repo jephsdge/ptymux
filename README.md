@@ -1,8 +1,12 @@
 # ptymux
 
+[中文文档](README.zh-CN.md)
+
 `ptymux` is a small command-line PTY multiplexer. It keeps long-lived shell
 processes behind named targets, so repeated commands can share shell state such
-as the current directory and exported environment variables.
+as the current directory, environment variables, and an active SSH session.
+
+## Target Paths
 
 A target is a path with up to three parts:
 
@@ -12,7 +16,7 @@ name/group
 name/group/shell
 ```
 
-Shorter forms are allowed:
+Shorter forms are expanded with `default`:
 
 ```text
 work             -> work/default/default
@@ -22,6 +26,9 @@ work/main/build  -> work/main/build
 
 Internally, those three parts map to `session`, `pane`, and `tab`. The CLI uses
 `target` as the public concept so day-to-day commands stay simple.
+
+Targets are created lazily. The first command for a target creates its backing
+`/bin/sh` process and PTY automatically.
 
 ## Install
 
@@ -37,7 +44,7 @@ Optionally move it somewhere on your `PATH`:
 install -m 0755 ptymux ~/.local/bin/ptymux
 ```
 
-## Usage
+## Basic Usage
 
 Run commands in a persistent target:
 
@@ -47,10 +54,7 @@ ptymux work "cd /tmp"
 ptymux work "pwd"
 ```
 
-The output is terminal-like transcript output. Commands and prompts are visible,
-but ptymux internal marker lines are hidden. `run`, `idle`, and `send` use the
-target's terminal screen state to render the current prompt line before command
-echo. The last command includes:
+The final `pwd` runs in the same shell and includes:
 
 ```text
 /tmp
@@ -63,14 +67,33 @@ ptymux work/main/build "go test ./..."
 ptymux work/main/shell "pwd"
 ```
 
-Targets are created lazily. The first command for a target creates its backing
-shell and PTY automatically.
+Output is terminal-like transcript output. Prompts and command echoes are
+visible, but ptymux internal marker lines are hidden. `run`, `idle`, and `send`
+use a VT terminal emulator to render the current prompt line before command
+echo, so output looks like a normal terminal:
 
-## Idle Mode
+```text
+sh-5.3$ pwd
+/home/work/Projects/ptymux
+sh-5.3$
+```
 
-Use `idle` for commands that enter or leave an interactive shell, such as `ssh`.
-Idle mode does not append a marker. It returns after PTY output has been quiet
-for a short period.
+## Command Modes
+
+### Run Mode
+
+Run mode is the default:
+
+```sh
+ptymux work "git status"
+```
+
+It appends an internal completion marker, waits for that marker, filters it from
+output, and returns the command exit code. Use this for normal shell commands.
+
+### Idle Mode
+
+Use `idle` for commands that enter or leave an interactive shell, such as SSH:
 
 ```sh
 ptymux idle work "ssh admin@localhost -p 2222"
@@ -78,39 +101,25 @@ ptymux work "pwd"
 ptymux idle work "exit"
 ```
 
-Default command mode is still better for normal commands because it has a
-reliable completion marker and exit code. The marker is internal and is filtered
-from output:
-
-```sh
-ptymux work "git status"
-```
+Idle mode does not append a marker. It sends the command and returns after PTY
+output has been quiet for a short period.
 
 Idle mode is heuristic. Commands with delayed output, such as
 `sleep 2 && echo done`, can return before all output arrives.
 
-## Send Mode
+### Send Mode
 
-Use `send` when you want to write input to the target and then follow its
-output. It does not append a completion marker. It keeps streaming output until
-you stop the client with `Ctrl+C`; the target keeps running.
+Use `send` when you want to write input to the target and then follow output:
 
 ```sh
-ptymux send work "exit"
+ptymux send work "ls"
 ```
 
-`send` uses the target's terminal screen state to print the current prompt line
-before streamed output, so command echoes look like a normal terminal:
+`send` does not append a marker. It keeps streaming output until you stop the
+client with `Ctrl+C`; the target keeps running.
 
-```text
-sh-5.3$ ls
-LICENSE  README.md  cmd  go.mod  go.sum  internal  ptymux
-sh-5.3$
-```
-
-This is useful when the target is inside an interactive program or a remote
-shell and a marker would not be reliable. For example, after an SSH password
-prompt:
+This is useful when the target is inside an interactive program or remote shell
+and a marker would not be reliable. For example, after an SSH password prompt:
 
 ```sh
 ptymux send work "your-password"
@@ -119,6 +128,17 @@ ptymux send work "your-password"
 For SSH password prompts, prefer SSH keys or an agent. Avoid putting passwords
 directly in command arguments because they can be saved in shell history or
 visible in process listings.
+
+### Ctrl+C
+
+Send Ctrl+C to a target:
+
+```sh
+ptymux ctrl-c work
+```
+
+This writes the ETX byte (`0x03`) to the target PTY and follows output, just like
+`send`. Stop observing with `Ctrl+C`; the target remains alive.
 
 ## Listing Targets
 
@@ -168,9 +188,10 @@ ptymux --socket /tmp/project-a.sock stop
 
 - Each full target path resolves to a long-lived `/bin/sh` process attached to a
   PTY.
-- Output from stdout and stderr is combined, like a normal terminal.
-- Interactive full-screen programs such as `vim`, `top`, and `ssh` are not a
-  goal for the synchronous command mode yet.
+- PTY output is combined stdout/stderr, like a normal terminal.
+- `send` and `ctrl-c` stream output until the client disconnects.
+- There is no full interactive attach mode yet; input is still sent one command
+  at a time.
 
 ## License
 
