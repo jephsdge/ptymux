@@ -1,12 +1,17 @@
 package server
 
 import (
+	"io"
 	"sort"
 	"sync"
 )
 
 type Runner interface {
 	Run(command string) (RunResult, error)
+	RunIdle(command string) (RunResult, error)
+	Send(input string) error
+	SendFollow(input string, output io.Writer, done <-chan struct{}) error
+	CtrlCFollow(output io.Writer, done <-chan struct{}) error
 	Close() error
 }
 

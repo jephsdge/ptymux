@@ -15,6 +15,9 @@ const (
 	ActionList   Action = "list"
 	ActionKill   Action = "kill"
 	ActionStop   Action = "stop"
+	ActionIdle   Action = "idle"
+	ActionSend   Action = "send"
+	ActionCtrlC  Action = "ctrl-c"
 )
 
 type Config struct {
@@ -47,6 +50,15 @@ func Parse(args []string) (Config, error) {
 			args = args[1:]
 		case "stop":
 			cfg.Action = ActionStop
+			args = args[1:]
+		case "idle":
+			cfg.Action = ActionIdle
+			args = args[1:]
+		case "send":
+			cfg.Action = ActionSend
+			args = args[1:]
+		case "ctrl-c":
+			cfg.Action = ActionCtrlC
 			args = args[1:]
 		}
 	}
@@ -97,6 +109,18 @@ func Parse(args []string) (Config, error) {
 				return Config{}, fmt.Errorf("%s does not accept positional arguments", cfg.Action)
 			}
 			return cfg, nil
+		case "idle":
+			cfg.Action = ActionIdle
+			rest = rest[1:]
+			return applyCommandTarget(&cfg, rest, "idle")
+		case "send":
+			cfg.Action = ActionSend
+			rest = rest[1:]
+			return applyCommandTarget(&cfg, rest, "send")
+		case "ctrl-c":
+			cfg.Action = ActionCtrlC
+			rest = rest[1:]
+			return applyTargetOnly(&cfg, rest, "ctrl-c")
 		}
 	}
 
@@ -127,10 +151,43 @@ func Parse(args []string) (Config, error) {
 		return cfg, nil
 	}
 
+	if cfg.Action == ActionIdle {
+		return applyCommandTarget(&cfg, rest, "idle")
+	}
+
+	if cfg.Action == ActionSend {
+		return applyCommandTarget(&cfg, rest, "send")
+	}
+
+	if cfg.Action == ActionCtrlC {
+		return applyTargetOnly(&cfg, rest, "ctrl-c")
+	}
+
 	if len(rest) != 0 {
 		return Config{}, fmt.Errorf("%s does not accept positional arguments", cfg.Action)
 	}
 	return cfg, nil
+}
+
+func applyTargetOnly(cfg *Config, rest []string, action string) (Config, error) {
+	if len(rest) != 1 {
+		return Config{}, fmt.Errorf("%s requires exactly one target", action)
+	}
+	if err := applyTarget(cfg, rest[0], false); err != nil {
+		return Config{}, err
+	}
+	return *cfg, nil
+}
+
+func applyCommandTarget(cfg *Config, rest []string, action string) (Config, error) {
+	if len(rest) < 2 {
+		return Config{}, fmt.Errorf("%s requires target and input", action)
+	}
+	if err := applyTarget(cfg, rest[0], false); err != nil {
+		return Config{}, err
+	}
+	cfg.Command = strings.Join(rest[1:], " ")
+	return *cfg, nil
 }
 
 func applyTarget(cfg *Config, target string, partial bool) error {

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"io"
 	"testing"
 	"time"
 )
@@ -56,6 +57,16 @@ type fakeRunner struct {
 }
 
 func (f *fakeRunner) Run(string) (RunResult, error) { return RunResult{}, nil }
+func (f *fakeRunner) RunIdle(string) (RunResult, error) {
+	return RunResult{}, nil
+}
+func (f *fakeRunner) Send(string) error { return nil }
+func (f *fakeRunner) SendFollow(string, io.Writer, <-chan struct{}) error {
+	return nil
+}
+func (f *fakeRunner) CtrlCFollow(io.Writer, <-chan struct{}) error {
+	return nil
+}
 func (f *fakeRunner) Close() error {
 	f.closed = true
 	return nil

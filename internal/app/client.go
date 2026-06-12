@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -37,6 +38,18 @@ func Run(cfg Config) (server.Response, error) {
 		Command: cfg.Command,
 	}
 
+	if cfg.Action == ActionSend || cfg.Action == ActionCtrlC {
+		if err := streamSend(socketPath, req, os.Stdout); err != nil {
+			if startErr := startDaemon(socketPath); startErr != nil {
+				return server.Response{}, fmt.Errorf("%v; also failed to start daemon: %w", err, startErr)
+			}
+			if err := streamSend(socketPath, req, os.Stdout); err != nil {
+				return server.Response{}, err
+			}
+		}
+		return server.Response{}, nil
+	}
+
 	resp, err := send(socketPath, req)
 	if err != nil && cfg.Action != ActionStop {
 		if startErr := startDaemon(socketPath); startErr != nil {
@@ -51,6 +64,20 @@ func Run(cfg Config) (server.Response, error) {
 		return resp, errors.New(resp.Error)
 	}
 	return resp, nil
+}
+
+func streamSend(socketPath string, req server.Request, output io.Writer) error {
+	conn, err := net.DialTimeout("unix", socketPath, time.Second)
+	if err != nil {
+		return fmt.Errorf("connect daemon at %s: %w", socketPath, err)
+	}
+	defer conn.Close()
+
+	if err := json.NewEncoder(conn).Encode(req); err != nil {
+		return err
+	}
+	_, err = io.Copy(output, conn)
+	return err
 }
 
 func startDaemon(socketPath string) error {

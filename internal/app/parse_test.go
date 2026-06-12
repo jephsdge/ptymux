@@ -86,6 +86,60 @@ func TestParseStopAction(t *testing.T) {
 	}
 }
 
+func TestParseIdleTargetPath(t *testing.T) {
+	cfg, err := Parse([]string{"idle", "work/main", "printf hi"})
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+
+	if cfg.Action != ActionIdle {
+		t.Fatalf("Action = %q, want %q", cfg.Action, ActionIdle)
+	}
+	if cfg.Session != "work" || cfg.Pane != "main" || cfg.Tab != "default" {
+		t.Fatalf("target = %q/%q/%q, want work/main/default", cfg.Session, cfg.Pane, cfg.Tab)
+	}
+	if cfg.Command != "printf hi" {
+		t.Fatalf("Command = %q, want printf hi", cfg.Command)
+	}
+}
+
+func TestParseSendTargetPath(t *testing.T) {
+	cfg, err := Parse([]string{"send", "work", "exit"})
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+
+	if cfg.Action != ActionSend {
+		t.Fatalf("Action = %q, want %q", cfg.Action, ActionSend)
+	}
+	if cfg.Session != "work" || cfg.Pane != "default" || cfg.Tab != "default" {
+		t.Fatalf("target = %q/%q/%q, want work/default/default", cfg.Session, cfg.Pane, cfg.Tab)
+	}
+	if cfg.Command != "exit" {
+		t.Fatalf("Command = %q, want exit", cfg.Command)
+	}
+}
+
+func TestParseSendRequiresTargetAndInput(t *testing.T) {
+	if _, err := Parse([]string{"send", "work"}); err == nil {
+		t.Fatal("Parse returned nil error, want error")
+	}
+}
+
+func TestParseCtrlCTargetPath(t *testing.T) {
+	cfg, err := Parse([]string{"ctrl-c", "work/main"})
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+
+	if cfg.Action != ActionCtrlC {
+		t.Fatalf("Action = %q, want %q", cfg.Action, ActionCtrlC)
+	}
+	if cfg.Session != "work" || cfg.Pane != "main" || cfg.Tab != "default" {
+		t.Fatalf("target = %q/%q/%q, want work/main/default", cfg.Session, cfg.Pane, cfg.Tab)
+	}
+}
+
 func TestParseListActionAfterFlags(t *testing.T) {
 	cfg, err := Parse([]string{"--socket", "/tmp/ptymux.sock", "list"})
 	if err != nil {
