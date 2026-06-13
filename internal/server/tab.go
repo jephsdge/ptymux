@@ -692,15 +692,64 @@ func wrapCommand(command, token string) string {
 }
 
 func (r *PTYRunner) Close() error {
-	if r.file != nil {
+	var firstErr error
+	if r.command != nil && r.command.Process != nil {
+		if err := signalProcessGroup(r.command.Process.Pid, syscall.SIGTERM); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	waitDone := r.waitProcess()
+	if !waitWithTimeout(waitDone, 500*time.Millisecond) {
+		if r.file != nil {
+			_ = r.file.Close()
+		}
+		if r.command != nil && r.command.Process != nil {
+			if err := signalProcessGroup(r.command.Process.Pid, syscall.SIGKILL); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		waitWithTimeout(waitDone, time.Second)
+	} else if r.file != nil {
 		_ = r.file.Close()
 	}
 	if r.readerDone != nil {
 		<-r.readerDone
 	}
-	if r.command != nil && r.command.Process != nil {
-		_ = r.command.Process.Kill()
-		_, _ = r.command.Process.Wait()
+	return firstErr
+}
+
+func (r *PTYRunner) waitProcess() <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		if r.command != nil && r.command.Process != nil {
+			_, _ = r.command.Process.Wait()
+		}
+		close(done)
+	}()
+	return done
+}
+
+func waitWithTimeout(done <-chan struct{}, timeout time.Duration) bool {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+func signalProcessGroup(pid int, signal syscall.Signal) error {
+	pgid, err := syscall.Getpgid(pid)
+	if err != nil {
+		if errors.Is(err, syscall.ESRCH) {
+			return nil
+		}
+		return err
+	}
+	if err := syscall.Kill(-pgid, signal); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return err
 	}
 	return nil
 }

@@ -226,6 +226,20 @@ ptymux follow work
 用 `Ctrl+C` 停止观察；target 仍然保留。
 `follow` 是只读订阅，只观察后续输出，不会锁住 target。
 
+### Kill 模式
+
+关闭一个 target，并从 daemon 中移除：
+
+```sh
+ptymux kill work
+ptymux kill work/main/build
+```
+
+`kill` 会向该 target shell 所在的进程组发送信号，关闭 PTY，并从内存 store
+中移除这个 target。下次再使用同一个 target 时，会启动一个新的 shell。
+
+为了兼容旧行为，不带 target 的 `ptymux kill` 会关闭所有 managed shells。
+
 ## 查看 Targets
 
 列出所有 targets：
@@ -254,6 +268,12 @@ ptymux list work/main
 
 ```sh
 ptymux stop
+```
+
+只关闭某个 target，不停止 daemon：
+
+```sh
+ptymux kill work
 ```
 
 默认 socket 路径是：

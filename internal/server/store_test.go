@@ -57,6 +57,83 @@ func TestDaemonStopClosesTabs(t *testing.T) {
 	}
 }
 
+func TestStoreCloseAllClearsTargets(t *testing.T) {
+	store := NewStore()
+	runner := &fakeRunner{}
+	store.GetOrCreate("session1", "pane1", "tab1", func() Runner {
+		return runner
+	})
+
+	if err := store.CloseAll(); err != nil {
+		t.Fatalf("CloseAll returned error: %v", err)
+	}
+
+	if !runner.closed {
+		t.Fatal("runner was not closed")
+	}
+	if got := store.Snapshot(); len(got.Sessions) != 0 {
+		t.Fatalf("snapshot = %+v, want no targets", got)
+	}
+}
+
+func TestStoreCloseTargetClosesAndRemovesExactTarget(t *testing.T) {
+	store := NewStore()
+	targetRunner := &fakeRunner{}
+	otherRunner := &fakeRunner{}
+	store.GetOrCreate("work", "main", "build", func() Runner {
+		return targetRunner
+	})
+	store.GetOrCreate("work", "main", "other", func() Runner {
+		return otherRunner
+	})
+
+	if err := store.CloseTarget("work", "main", "build"); err != nil {
+		t.Fatalf("CloseTarget returned error: %v", err)
+	}
+
+	if !targetRunner.closed {
+		t.Fatal("target runner was not closed")
+	}
+	if otherRunner.closed {
+		t.Fatal("other runner was closed")
+	}
+	snapshot := store.SnapshotTarget("work", "main", "")
+	if len(snapshot.Sessions) != 1 || len(snapshot.Sessions[0].Panes) != 1 {
+		t.Fatalf("snapshot = %+v, want work/main to remain", snapshot)
+	}
+	tabs := snapshot.Sessions[0].Panes[0].Tabs
+	if len(tabs) != 1 || tabs[0].Name != "other" {
+		t.Fatalf("tabs = %+v, want only other", tabs)
+	}
+}
+
+func TestDaemonKillTargetClosesOnlyTarget(t *testing.T) {
+	daemon := NewDaemon("")
+	targetRunner := &fakeRunner{}
+	otherRunner := &fakeRunner{}
+	daemon.store.GetOrCreate("work", "default", "default", func() Runner {
+		return targetRunner
+	})
+	daemon.store.GetOrCreate("other", "default", "default", func() Runner {
+		return otherRunner
+	})
+
+	resp := daemon.Handle(Request{Action: "kill", Session: "work", Pane: "default", Tab: "default"})
+
+	if resp.Error != "" {
+		t.Fatalf("kill returned error: %s", resp.Error)
+	}
+	if !targetRunner.closed {
+		t.Fatal("target runner was not closed")
+	}
+	if otherRunner.closed {
+		t.Fatal("other runner was closed")
+	}
+	if got := daemon.store.SnapshotTarget("work", "", ""); len(got.Sessions) != 0 {
+		t.Fatalf("work snapshot = %+v, want removed target", got)
+	}
+}
+
 func TestDaemonHandleCommandRoutesToRunner(t *testing.T) {
 	daemon := NewDaemon("")
 	runner := &fakeRunner{}

@@ -112,6 +112,34 @@ func TestParseStopAction(t *testing.T) {
 	}
 }
 
+func TestParseKillAll(t *testing.T) {
+	cfg, err := Parse([]string{"kill"})
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+
+	if cfg.Action != ActionKill {
+		t.Fatalf("Action = %q, want %q", cfg.Action, ActionKill)
+	}
+	if cfg.Session != "" || cfg.Pane != "" || cfg.Tab != "" {
+		t.Fatalf("target = %q/%q/%q, want empty target for kill all", cfg.Session, cfg.Pane, cfg.Tab)
+	}
+}
+
+func TestParseKillTargetPath(t *testing.T) {
+	cfg, err := Parse([]string{"kill", "work/main/build"})
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+
+	if cfg.Action != ActionKill {
+		t.Fatalf("Action = %q, want %q", cfg.Action, ActionKill)
+	}
+	if cfg.Session != "work" || cfg.Pane != "main" || cfg.Tab != "build" {
+		t.Fatalf("target = %q/%q/%q, want work/main/build", cfg.Session, cfg.Pane, cfg.Tab)
+	}
+}
+
 func TestParseIdleTargetPath(t *testing.T) {
 	cfg, err := Parse([]string{"idle", "work/main", "printf hi"})
 	if err != nil {

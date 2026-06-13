@@ -191,7 +191,13 @@ func (d *Daemon) Handle(req Request) Response {
 	case "list":
 		return Response{Snapshot: d.store.SnapshotTarget(req.Session, req.Pane, req.Tab)}
 	case "kill":
-		if err := d.store.CloseAll(); err != nil {
+		var err error
+		if req.Session == "" {
+			err = d.store.CloseAll()
+		} else {
+			err = d.store.CloseTarget(req.Session, req.Pane, req.Tab)
+		}
+		if err != nil {
 			return Response{Error: err.Error()}
 		}
 		return Response{}

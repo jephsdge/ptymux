@@ -64,6 +64,11 @@ code path that reads from the PTY fd. The reader:
 
 Command methods must not read the PTY directly.
 
+Each target shell is started through `creack/pty`, which creates a new session
+and process group for the shell. Target shutdown must signal the shell process
+group, not only the shell PID, so foreground/background jobs such as local SSH
+clients are cleaned up with the target.
+
 Subscription types:
 
 - Reliable subscriptions are used by boundary-sensitive operations such as
@@ -124,6 +129,12 @@ Locking rules:
 - Follow:
   `ptymux follow work`
   Read-only live subscription. It must not block other commands.
+
+- Kill:
+  `ptymux kill work`
+  Closes one target, removes it from the store, and leaves the daemon running.
+  `ptymux kill` without a target remains a compatibility path for closing all
+  targets.
 
 - Help:
   `ptymux -h`, `ptymux --help`, `ptymux help`, and subcommand help flags such
@@ -222,6 +233,7 @@ Do not commit generated binaries.
 - Preserve existing public CLI behavior unless the user explicitly changes it.
 - Prefer tests before behavior changes.
 - For PTY/concurrency work, verify with both normal tests and race tests.
+- For process shutdown work, preserve process-group cleanup semantics.
 - Avoid broad refactors that are not required for the requested behavior.
 - Use `rg` for searching.
 - Keep code and documentation ASCII unless there is a clear reason otherwise.

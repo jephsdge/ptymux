@@ -235,6 +235,21 @@ Stop observing with `Ctrl+C`; the target remains alive.
 `follow` is read-only and subscribes to future output without locking the
 target.
 
+### Kill Mode
+
+Close one target and remove it from the daemon:
+
+```sh
+ptymux kill work
+ptymux kill work/main/build
+```
+
+`kill` sends signals to the target shell's process group, closes the PTY, and
+removes the target from the in-memory store. The next command for that target
+starts a fresh shell.
+
+For compatibility, `ptymux kill` without a target closes all managed shells.
+
 ## Listing Targets
 
 List all targets:
@@ -264,6 +279,12 @@ Stop the daemon and close all managed shells:
 
 ```sh
 ptymux stop
+```
+
+Close one target without stopping the daemon:
+
+```sh
+ptymux kill work
 ```
 
 The default socket path is:

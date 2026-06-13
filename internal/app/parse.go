@@ -91,6 +91,8 @@ func Parse(args []string) (Config, error) {
 	switch cfg.Action {
 	case ActionHelp:
 		return cfg, nil
+	case ActionKill:
+		return parseKill(cfg, args)
 	case ActionSend:
 		return parseSend(cfg, args)
 	case ActionCommand:
@@ -141,10 +143,8 @@ func Parse(args []string) (Config, error) {
 			return cfg, nil
 		case "kill":
 			cfg.Action = ActionKill
-			if len(rest) != 1 {
-				return Config{}, fmt.Errorf("%s does not accept positional arguments", cfg.Action)
-			}
-			return cfg, nil
+			rest = rest[1:]
+			return parseKill(cfg, rest)
 		case "stop":
 			cfg.Action = ActionStop
 			if len(rest) != 1 {
@@ -217,6 +217,10 @@ func Parse(args []string) (Config, error) {
 		return parseCommand(cfg, rest)
 	}
 
+	if cfg.Action == ActionKill {
+		return parseKill(cfg, rest)
+	}
+
 	if cfg.Action == ActionCtrlC {
 		return applyTargetOnly(&cfg, rest, "ctrl-c")
 	}
@@ -259,6 +263,33 @@ func parseSend(cfg Config, args []string) (Config, error) {
 		cfg.Wait = wait
 	}
 	return applyCommandTarget(&cfg, fs.Args(), "send")
+}
+
+func parseKill(cfg Config, args []string) (Config, error) {
+	if hasHelpArg(args) {
+		cfg.Action = ActionHelp
+		return cfg, nil
+	}
+	fs := flag.NewFlagSet("kill", flag.ContinueOnError)
+	registerSocketFlag(fs, &cfg)
+	if err := fs.Parse(args); err != nil {
+		return Config{}, err
+	}
+	rest := fs.Args()
+	switch len(rest) {
+	case 0:
+		cfg.Session = ""
+		cfg.Pane = ""
+		cfg.Tab = ""
+		return cfg, nil
+	case 1:
+		if err := applyTarget(&cfg, rest[0], false); err != nil {
+			return Config{}, err
+		}
+		return cfg, nil
+	default:
+		return Config{}, errors.New("kill accepts at most one target")
+	}
 }
 
 func parseCommand(cfg Config, args []string) (Config, error) {
@@ -371,6 +402,7 @@ Usage:
   ptymux read [-n N] <target>
   ptymux follow <target>
   ptymux list [target]
+  ptymux kill [target]
   ptymux stop
   ptymux -h | --help | help
 
@@ -386,6 +418,7 @@ Examples:
   ptymux command work "ctrl-c"
   ptymux read -n 3 work
   ptymux follow work
+  ptymux kill work
 
 Options:
   --socket PATH    use a custom daemon socket

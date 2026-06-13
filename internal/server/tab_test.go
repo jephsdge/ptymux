@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -154,6 +155,23 @@ func TestPTYRunnerPreservesShellState(t *testing.T) {
 	}
 	if strings.Contains(result.Output, "__ptymux_") || strings.Contains(result.Output, "__PTYMUX_DONE_") {
 		t.Fatalf("Output leaked marker internals: %q", result.Output)
+	}
+}
+
+func TestPTYRunnerStartsShellInOwnProcessGroup(t *testing.T) {
+	runner, err := NewPTYRunner("/bin/sh")
+	if err != nil {
+		t.Fatalf("NewPTYRunner returned error: %v", err)
+	}
+	defer runner.Close()
+
+	pid := runner.command.Process.Pid
+	pgid, err := syscall.Getpgid(pid)
+	if err != nil {
+		t.Fatalf("Getpgid returned error: %v", err)
+	}
+	if pgid != pid {
+		t.Fatalf("pgid = %d, want shell pid %d", pgid, pid)
 	}
 }
 

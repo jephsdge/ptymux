@@ -192,5 +192,34 @@ func (s *Store) CloseAll() error {
 			}
 		}
 	}
+	s.sessions = make(map[string]*Session)
 	return firstErr
+}
+
+func (s *Store) CloseTarget(sessionName, paneName, tabName string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	session := s.sessions[sessionName]
+	if session == nil {
+		return nil
+	}
+	pane := session.Panes[paneName]
+	if pane == nil {
+		return nil
+	}
+	tab := pane.Tabs[tabName]
+	if tab == nil {
+		return nil
+	}
+
+	err := tab.Runner.Close()
+	delete(pane.Tabs, tabName)
+	if len(pane.Tabs) == 0 {
+		delete(session.Panes, paneName)
+	}
+	if len(session.Panes) == 0 {
+		delete(s.sessions, sessionName)
+	}
+	return err
 }
