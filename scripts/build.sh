@@ -7,6 +7,12 @@ GOOS="${GOOS:-linux}"
 GOARCH="${GOARCH:-amd64}"
 CGO_ENABLED="${CGO_ENABLED:-0}"
 BIN_NAME="${BIN_NAME:-ptymux}"
+TARGET="${TARGET:-dist}"
+
+if [ "$TARGET" = "skill" ]; then
+	OUT_DIR="$ROOT_DIR/skills/use-ptymux/assets"
+	BIN_NAME="ptymux"
+fi
 
 mkdir -p "$OUT_DIR"
 

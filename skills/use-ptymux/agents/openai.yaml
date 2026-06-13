@@ -1,0 +1,4 @@
+interface:
+  display_name: "Use ptymux"
+  short_description: "Use persistent PTY targets from Codex"
+  default_prompt: "Use $use-ptymux to run commands in a persistent target."

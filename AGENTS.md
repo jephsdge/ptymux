@@ -214,6 +214,23 @@ Keep both user READMEs in sync:
 - `README.md`
 - `README.zh-CN.md`
 
+When CLI behavior, flags, command semantics, examples, or user-facing workflows
+change, also update the ptymux usage skill:
+
+- `skills/use-ptymux/SKILL.md`
+- `skills/use-ptymux/references/ptymux-cli.md`
+
+The skill is for accurate and efficient binary usage only. Do not include
+implementation details such as daemon internals, PTY reader/subscriber design,
+marker tokens, process groups, Go package layout, build/release steps, or test
+strategy in the skill.
+
+After updating the skill as part of a feature or usage change, use a subagent to
+validate it before finishing the feature. The subagent review should check that
+the skill matches the current CLI, covers the changed usage, avoids internal
+implementation details, avoids non-usage build/release content, and gives clear
+examples for the relevant commands and flags.
+
 Do not commit `docs/superpowers/`; it is local planning material and is ignored
 by `.gitignore`.
 
