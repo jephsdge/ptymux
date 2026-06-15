@@ -11,10 +11,12 @@ import (
 )
 
 type UserConfig struct {
+	Shell       string
 	AutoRelease server.AutoReleaseOptions
 }
 
 type rawUserConfig struct {
+	Shell       string                `json:"shell"`
 	AutoRelease *rawAutoReleaseConfig `json:"auto_release"`
 }
 
@@ -45,9 +47,15 @@ func LoadUserConfig() (UserConfig, error) {
 		return UserConfig{}, fmt.Errorf("read %s: %w", path, err)
 	}
 	if raw.AutoRelease == nil {
+		if raw.Shell != "" {
+			cfg.Shell = raw.Shell
+		}
 		return cfg, nil
 	}
 
+	if raw.Shell != "" {
+		cfg.Shell = raw.Shell
+	}
 	if raw.AutoRelease.Enabled != nil {
 		cfg.AutoRelease.Enabled = *raw.AutoRelease.Enabled
 	}
@@ -70,6 +78,7 @@ func LoadUserConfig() (UserConfig, error) {
 
 func defaultUserConfig() UserConfig {
 	return UserConfig{
+		Shell: "/bin/sh",
 		AutoRelease: server.AutoReleaseOptions{
 			Enabled:           true,
 			TargetIdleTimeout: 8 * time.Hour,

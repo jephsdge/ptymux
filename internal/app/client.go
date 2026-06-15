@@ -34,7 +34,7 @@ func Run(cfg Config) (server.Response, error) {
 		if err != nil {
 			return server.Response{}, err
 		}
-		return server.Response{}, server.NewDaemonWithOptions("", server.DaemonOptions{
+		return server.Response{}, server.NewDaemonWithOptions(userConfig.Shell, server.DaemonOptions{
 			AutoRelease: userConfig.AutoRelease,
 		}).Serve(socketPath)
 	}

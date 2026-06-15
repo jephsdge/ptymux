@@ -24,6 +24,9 @@ func TestLoadUserConfigDefaultsAutoRelease(t *testing.T) {
 	if cfg.AutoRelease.DaemonIdleTimeout != 30*time.Minute {
 		t.Fatalf("DaemonIdleTimeout = %s, want 30m", cfg.AutoRelease.DaemonIdleTimeout)
 	}
+	if cfg.Shell != "/bin/sh" {
+		t.Fatalf("Shell = %q, want /bin/sh", cfg.Shell)
+	}
 }
 
 func TestDefaultSocketPathUsesPtymuxSocketDirectory(t *testing.T) {
@@ -45,6 +48,7 @@ func TestLoadUserConfigOverridesAutoRelease(t *testing.T) {
 		t.Fatalf("MkdirAll returned error: %v", err)
 	}
 	config := []byte(`{
+  "shell": "/bin/bash",
   "auto_release": {
     "enabled": false,
     "target_idle_timeout": "15m",
@@ -68,6 +72,9 @@ func TestLoadUserConfigOverridesAutoRelease(t *testing.T) {
 	}
 	if cfg.AutoRelease.DaemonIdleTimeout != 2*time.Hour {
 		t.Fatalf("DaemonIdleTimeout = %s, want 2h", cfg.AutoRelease.DaemonIdleTimeout)
+	}
+	if cfg.Shell != "/bin/bash" {
+		t.Fatalf("Shell = %q, want /bin/bash", cfg.Shell)
 	}
 }
 

@@ -212,6 +212,7 @@ Default configuration:
 
 ```json
 {
+  "shell": "/bin/sh",
   "auto_release": {
     "enabled": true,
     "target_idle_timeout": "8h",
@@ -219,6 +220,13 @@ Default configuration:
   }
 }
 ```
+
+`shell` controls the program used for newly created targets. Use `/bin/bash`
+when bash prompt behavior or aliases are needed.
+
+Configuration is read when the daemon starts. Restart the daemon with
+`ptymux stop` for shell or auto-release changes to affect an already running
+daemon.
 
 `target_idle_timeout` releases a target after it has not been used for the
 configured duration. `daemon_idle_timeout` stops an empty daemon after it has no

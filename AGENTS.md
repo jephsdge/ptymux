@@ -38,9 +38,9 @@ prefer the word `target`.
   The default socket is `~/.ptymux/sockets/ptymux-default.sock`.
 
 - `internal/app/config.go`
-  Loads optional user configuration from `~/.ptymux/config.json`. Defaults
-  enable automatic release with an 8h target idle timeout and a 30m empty daemon
-  idle timeout.
+  Loads optional user configuration from `~/.ptymux/config.json`. Defaults use
+  `/bin/sh` as the target shell and enable automatic release with an 8h target
+  idle timeout and a 30m empty daemon idle timeout.
 
 - `internal/server/daemon.go`
   Unix socket server. Decodes requests, locates/creates target runners, and
@@ -150,6 +150,12 @@ Locking rules:
   targets. `daemon_idle_timeout` defaults to `30m` and stops an empty idle
   daemon, which removes its socket. A timeout of `0` disables that specific
   release behavior.
+
+- Shell configuration:
+  `~/.ptymux/config.json`
+  `shell` defaults to `/bin/sh`. Set it to `/bin/bash` when users need bash
+  prompt behavior or aliases. Configuration is read when the daemon starts;
+  existing daemons and targets do not hot-reload shell changes.
 
 - Help:
   `ptymux -h`, `ptymux --help`, `ptymux help`, and subcommand help flags such

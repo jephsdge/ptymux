@@ -431,9 +431,11 @@ Default socket:
 
 Config:
   ~/.ptymux/config.json
+  shell defaults to /bin/sh
   auto_release.enabled defaults to true
   auto_release.target_idle_timeout defaults to 8h
   auto_release.daemon_idle_timeout defaults to 30m
+  restart with ptymux stop after changing daemon config
 `, "\n")
 }
 

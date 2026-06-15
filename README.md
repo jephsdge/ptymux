@@ -315,11 +315,21 @@ Default configuration:
 
 ```json
 {
+  "shell": "/bin/sh",
   "auto_release": {
     "enabled": true,
     "target_idle_timeout": "8h",
     "daemon_idle_timeout": "30m"
   }
+}
+```
+
+`shell` controls the program used for newly created targets. Use `/bin/bash`
+when you want bash prompt behavior and aliases from your bash configuration:
+
+```json
+{
+  "shell": "/bin/bash"
 }
 ```
 
@@ -339,8 +349,7 @@ Configuration is read when the daemon starts. Restart the daemon with
 
 ## Notes
 
-- Each full target path resolves to a long-lived `/bin/sh` process attached to a
-  PTY.
+- Each full target path resolves to a long-lived shell process attached to a PTY.
 - PTY output is combined stdout/stderr, like a normal terminal.
 - `send -f`, `follow`, and `ctrl-c` stream output until the client disconnects.
 - There is no full interactive attach mode yet; input is still sent one command

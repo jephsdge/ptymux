@@ -80,6 +80,9 @@ ptymux stop
   `~/.ptymux/sockets/ptymux-default.sock`.
 - Use a task-specific socket when isolation matters: `ptymux --socket /tmp/name.sock ...`.
 - Stop a temporary daemon when done: `ptymux --socket /tmp/name.sock stop`.
+- Use `~/.ptymux/config.json` with `"shell": "/bin/bash"` when bash prompt
+  behavior or aliases are needed; restart the daemon with `ptymux stop` after
+  changing shell configuration.
 - Use `ptymux kill <target>` to release one target while keeping the daemon
   alive.
 - Remember that `~/.ptymux/config.json` controls automatic target and daemon

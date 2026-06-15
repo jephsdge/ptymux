@@ -303,11 +303,21 @@ ptymux --socket /tmp/project-a.sock stop
 
 ```json
 {
+  "shell": "/bin/sh",
   "auto_release": {
     "enabled": true,
     "target_idle_timeout": "8h",
     "daemon_idle_timeout": "30m"
   }
+}
+```
+
+`shell` 控制新建 target 使用哪个 shell。如果希望使用 bash 的 prompt 和
+bash 配置里的 alias，可以设置为 `/bin/bash`：
+
+```json
+{
+  "shell": "/bin/bash"
 }
 ```
 
@@ -325,7 +335,7 @@ ptymux --socket /tmp/project-a.sock stop
 
 ## 说明
 
-- 每个完整 target 路径对应一个长期存活的 `/bin/sh` 进程，并连接到一个 PTY。
+- 每个完整 target 路径对应一个长期存活的 shell 进程，并连接到一个 PTY。
 - PTY 输出会像真实终端一样合并 stdout/stderr。
 - `send -f`、`follow` 和 `ctrl-c` 会持续输出，直到客户端断开。
 - 目前还没有完整 attach 模式；输入仍然是一条命令一条命令发送。
