@@ -50,7 +50,7 @@ func Run(cfg Config) (server.Response, error) {
 		ReadCount:  cfg.ReadCount,
 	}
 
-	if cfg.Action == ActionFollow || cfg.Action == ActionCtrlC || (cfg.Action == ActionSend && cfg.Follow) || (cfg.Action == ActionCommand && cfg.Follow) {
+	if cfg.Action == ActionFollow || cfg.Action == ActionCtrlC || (cfg.Action == ActionSend && cfg.Follow) || (cfg.Action == ActionCommand && cfg.Follow) || (cfg.Action == ActionKeys && cfg.Follow) {
 		if err := streamSend(socketPath, req, os.Stdout); err != nil {
 			if startErr := startDaemon(socketPath); startErr != nil {
 				return server.Response{}, fmt.Errorf("%v; also failed to start daemon: %w", err, startErr)

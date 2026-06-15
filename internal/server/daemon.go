@@ -97,9 +97,15 @@ func (d *Daemon) handle(conn net.Conn) {
 		return
 	}
 	d.markActivity()
-	if req.Action == "follow" || req.Action == "ctrl-c" || (req.Action == "send" && req.Follow) || (req.Action == "command" && req.Follow) {
+	if req.Action == "follow" || req.Action == "ctrl-c" || (req.Action == "send" && req.Follow) || (req.Action == "command" && req.Follow) || (req.Action == "keys" && req.Follow) {
 		if req.Action == "command" {
 			if _, err := parseKeySequence(req.Command); err != nil {
+				_ = json.NewEncoder(conn).Encode(Response{Error: err.Error()})
+				return
+			}
+		}
+		if req.Action == "keys" {
+			if _, err := parseKeySequenceNoEnter(req.Command); err != nil {
 				_ = json.NewEncoder(conn).Encode(Response{Error: err.Error()})
 				return
 			}
@@ -129,6 +135,8 @@ func (d *Daemon) handleStream(conn net.Conn, req Request) {
 		err = tab.Runner.Follow(conn, clientDone)
 	case "command":
 		err = tab.Runner.CommandFollow(req.Command, conn, clientDone)
+	case "keys":
+		err = tab.Runner.KeysFollow(req.Command, conn, clientDone)
 	default:
 		err = tab.Runner.SendFollow(req.Command, conn, clientDone)
 	}
@@ -184,6 +192,13 @@ func (d *Daemon) Handle(req Request) Response {
 			return Response{Error: err.Error()}
 		}
 		return Response{}
+	case "text":
+		tab, done := d.beginTargetUse(req)
+		defer done()
+		if err := tab.Runner.Text(req.Command); err != nil {
+			return Response{Error: err.Error()}
+		}
+		return Response{}
 	case "command":
 		tab, done := d.beginTargetUse(req)
 		defer done()
@@ -195,6 +210,20 @@ func (d *Daemon) Handle(req Request) Response {
 			return Response{Output: result.Output, ExitCode: result.ExitCode}
 		}
 		if err := tab.Runner.Command(req.Command); err != nil {
+			return Response{Error: err.Error()}
+		}
+		return Response{}
+	case "keys":
+		tab, done := d.beginTargetUse(req)
+		defer done()
+		if req.WaitMillis > 0 {
+			result, err := tab.Runner.KeysWait(req.Command, time.Duration(req.WaitMillis)*time.Millisecond)
+			if err != nil {
+				return Response{Error: err.Error()}
+			}
+			return Response{Output: result.Output, ExitCode: result.ExitCode}
+		}
+		if err := tab.Runner.Keys(req.Command); err != nil {
 			return Response{Error: err.Error()}
 		}
 		return Response{}
@@ -318,11 +347,19 @@ func (r *errorRunner) SendWait(string, time.Duration) (RunResult, error) {
 func (r *errorRunner) SendFollow(string, io.Writer, <-chan struct{}) error {
 	return r.err
 }
+func (r *errorRunner) Text(string) error    { return r.err }
 func (r *errorRunner) Command(string) error { return r.err }
 func (r *errorRunner) CommandWait(string, time.Duration) (RunResult, error) {
 	return RunResult{}, r.err
 }
 func (r *errorRunner) CommandFollow(string, io.Writer, <-chan struct{}) error {
+	return r.err
+}
+func (r *errorRunner) Keys(string) error { return r.err }
+func (r *errorRunner) KeysWait(string, time.Duration) (RunResult, error) {
+	return RunResult{}, r.err
+}
+func (r *errorRunner) KeysFollow(string, io.Writer, <-chan struct{}) error {
 	return r.err
 }
 func (r *errorRunner) Follow(io.Writer, <-chan struct{}) error {

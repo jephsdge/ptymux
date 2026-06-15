@@ -29,8 +29,8 @@ prefer the word `target`.
 
 - `internal/app/parse.go`
   CLI argument parsing. Supports default run mode plus `idle`, `send`,
-  `command`, `ctrl-c`, `read`, `follow`, `list`, `stop`, `kill`, `daemon`, and
-  `help`.
+  `text`, `command`, `keys`, `ctrl-c`, `read`, `follow`, `list`, `stop`,
+  `kill`, `daemon`, and `help`.
 
 - `internal/app/client.go`
   Client-side daemon communication. Starts the daemon automatically when needed.
@@ -61,7 +61,7 @@ prefer the word `target`.
   agents.
 
 - `internal/server/keys.go`
-  Parser for terminal key sequences used by `command`.
+  Parser for terminal key sequences used by `command` and `keys`.
 
 - `internal/server/protocol.go`
   JSON request/response types shared by app and server.
@@ -129,6 +129,15 @@ Locking rules:
   `ptymux command work "ctrl-o d"`
   Sends key sequences. Spaces mean sequential keys; hyphens combine modifiers.
   The sequence automatically appends Enter.
+
+- Text:
+  `ptymux text work "hello"`
+  Types literal text without automatically pressing Enter.
+
+- Keys:
+  `ptymux keys work "up enter"`
+  Sends key sequences without an implicit Enter. `keys -t` waits for quiet
+  output; `keys -f` streams until the client disconnects.
 
 - Legacy Ctrl+C:
   `ptymux ctrl-c work`

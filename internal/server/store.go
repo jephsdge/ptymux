@@ -13,9 +13,13 @@ type Runner interface {
 	Send(input string) error
 	SendWait(input string, quietFor time.Duration) (RunResult, error)
 	SendFollow(input string, output io.Writer, done <-chan struct{}) error
+	Text(input string) error
 	Command(keys string) error
 	CommandWait(keys string, quietFor time.Duration) (RunResult, error)
 	CommandFollow(keys string, output io.Writer, done <-chan struct{}) error
+	Keys(keys string) error
+	KeysWait(keys string, quietFor time.Duration) (RunResult, error)
+	KeysFollow(keys string, output io.Writer, done <-chan struct{}) error
 	Follow(output io.Writer, done <-chan struct{}) error
 	CtrlCFollow(output io.Writer, done <-chan struct{}) error
 	Read(count int) (RunResult, error)

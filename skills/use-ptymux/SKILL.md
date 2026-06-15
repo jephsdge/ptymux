@@ -50,22 +50,31 @@ ptymux send -f work "npm run dev"
 ptymux follow work
 ```
 
-5. Use `command` for terminal key sequences and `ctrl-c` only for the legacy Ctrl+C compatibility path:
+5. Use `text` to type literal text without Enter, `keys` to send exact key
+sequences without implicit Enter, and `command` only when you want ptymux to
+press Enter after the sequence:
 
 ```sh
+ptymux text work "hello"
+ptymux keys work "enter"
+ptymux keys -t 500ms work "ctrl-c"
 ptymux command work "ctrl-c"
-ptymux command -t 500ms work "ctrl-o d"
+```
+
+6. Use `ctrl-c` only for the legacy Ctrl+C compatibility path:
+
+```sh
 ptymux ctrl-c work
 ```
 
-6. Use `read` when the current terminal screen is enough, and `read -n N` for recent command regions visible in the terminal screen:
+7. Use `read` when the current terminal screen is enough, and `read -n N` for recent command regions visible in the terminal screen:
 
 ```sh
 ptymux read work
 ptymux read -n 3 work
 ```
 
-7. Use `kill <target>` to close one target without stopping the daemon. Use
+8. Use `kill <target>` to close one target without stopping the daemon. Use
 `stop` to close all targets and stop the daemon:
 
 ```sh

@@ -19,7 +19,9 @@ const (
 	ActionStop    Action = "stop"
 	ActionIdle    Action = "idle"
 	ActionSend    Action = "send"
+	ActionText    Action = "text"
 	ActionCommand Action = "command"
+	ActionKeys    Action = "keys"
 	ActionCtrlC   Action = "ctrl-c"
 	ActionRead    Action = "read"
 	ActionFollow  Action = "follow"
@@ -73,8 +75,14 @@ func Parse(args []string) (Config, error) {
 		case "send":
 			cfg.Action = ActionSend
 			args = args[1:]
+		case "text":
+			cfg.Action = ActionText
+			args = args[1:]
 		case "command":
 			cfg.Action = ActionCommand
+			args = args[1:]
+		case "keys":
+			cfg.Action = ActionKeys
 			args = args[1:]
 		case "ctrl-c":
 			cfg.Action = ActionCtrlC
@@ -95,8 +103,12 @@ func Parse(args []string) (Config, error) {
 		return parseKill(cfg, args)
 	case ActionSend:
 		return parseSend(cfg, args)
+	case ActionText:
+		return parseText(cfg, args)
 	case ActionCommand:
 		return parseCommand(cfg, args)
+	case ActionKeys:
+		return parseKeys(cfg, args)
 	case ActionIdle:
 		return parseIdle(cfg, args)
 	case ActionRead:
@@ -159,10 +171,18 @@ func Parse(args []string) (Config, error) {
 			cfg.Action = ActionSend
 			rest = rest[1:]
 			return parseSend(cfg, rest)
+		case "text":
+			cfg.Action = ActionText
+			rest = rest[1:]
+			return parseText(cfg, rest)
 		case "command":
 			cfg.Action = ActionCommand
 			rest = rest[1:]
 			return parseCommand(cfg, rest)
+		case "keys":
+			cfg.Action = ActionKeys
+			rest = rest[1:]
+			return parseKeys(cfg, rest)
 		case "ctrl-c":
 			cfg.Action = ActionCtrlC
 			rest = rest[1:]
@@ -213,8 +233,16 @@ func Parse(args []string) (Config, error) {
 		return parseSend(cfg, rest)
 	}
 
+	if cfg.Action == ActionText {
+		return parseText(cfg, rest)
+	}
+
 	if cfg.Action == ActionCommand {
 		return parseCommand(cfg, rest)
+	}
+
+	if cfg.Action == ActionKeys {
+		return parseKeys(cfg, rest)
 	}
 
 	if cfg.Action == ActionKill {
@@ -263,6 +291,19 @@ func parseSend(cfg Config, args []string) (Config, error) {
 		cfg.Wait = wait
 	}
 	return applyCommandTarget(&cfg, fs.Args(), "send")
+}
+
+func parseText(cfg Config, args []string) (Config, error) {
+	if hasHelpArg(args) {
+		cfg.Action = ActionHelp
+		return cfg, nil
+	}
+	fs := flag.NewFlagSet("text", flag.ContinueOnError)
+	registerSocketFlag(fs, &cfg)
+	if err := fs.Parse(args); err != nil {
+		return Config{}, err
+	}
+	return applyCommandTarget(&cfg, fs.Args(), "text")
 }
 
 func parseKill(cfg Config, args []string) (Config, error) {
@@ -316,6 +357,32 @@ func parseCommand(cfg Config, args []string) (Config, error) {
 		cfg.Wait = wait
 	}
 	return applyCommandTarget(&cfg, fs.Args(), "command")
+}
+
+func parseKeys(cfg Config, args []string) (Config, error) {
+	if hasHelpArg(args) {
+		cfg.Action = ActionHelp
+		return cfg, nil
+	}
+	fs := flag.NewFlagSet("keys", flag.ContinueOnError)
+	var waitValue string
+	registerSocketFlag(fs, &cfg)
+	fs.BoolVar(&cfg.Follow, "f", false, "follow output until interrupted")
+	fs.StringVar(&waitValue, "t", "", "wait until PTY output is quiet for this duration")
+	if err := fs.Parse(args); err != nil {
+		return Config{}, err
+	}
+	if cfg.Follow && waitValue != "" {
+		return Config{}, errors.New("keys -f and -t cannot be used together")
+	}
+	if waitValue != "" {
+		wait, err := parseWait(waitValue)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.Wait = wait
+	}
+	return applyCommandTarget(&cfg, fs.Args(), "keys")
 }
 
 func parseIdle(cfg Config, args []string) (Config, error) {
@@ -398,7 +465,9 @@ Usage:
   ptymux [--socket PATH] <target> <command>
   ptymux [--socket PATH] idle [-t DURATION] <target> <input>
   ptymux [--socket PATH] send [-f | -t DURATION] <target> <input>
+  ptymux [--socket PATH] text <target> <text>
   ptymux [--socket PATH] command [-f | -t DURATION] <target> <keys>
+  ptymux [--socket PATH] keys [-f | -t DURATION] <target> <keys>
   ptymux [--socket PATH] read [-n N] <target>
   ptymux [--socket PATH] follow <target>
   ptymux [--socket PATH] list [target]
@@ -415,7 +484,10 @@ Examples:
   ptymux work "pwd"
   ptymux work "cd /tmp"
   ptymux send -t 500ms work "pwd"
+  ptymux text work "hello world"
   ptymux command work "ctrl-c"
+  ptymux keys work "up enter"
+  ptymux keys -f work "pageup"
   ptymux read -n 3 work
   ptymux follow work
   ptymux kill work

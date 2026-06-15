@@ -163,6 +163,14 @@ func (r *PTYRunner) SendFollow(input string, output io.Writer, done <-chan struc
 	return r.sendFollow(input, output, 0, done)
 }
 
+func (r *PTYRunner) Text(input string) error {
+	r.commandMu.Lock()
+	defer r.commandMu.Unlock()
+
+	_, err := io.WriteString(r.file, input)
+	return err
+}
+
 func (r *PTYRunner) Command(keys string) error {
 	seq, err := parseKeySequence(keys)
 	if err != nil {
@@ -182,6 +190,27 @@ func (r *PTYRunner) CommandWait(keys string, quietFor time.Duration) (RunResult,
 
 func (r *PTYRunner) CommandFollow(keys string, output io.Writer, done <-chan struct{}) error {
 	return r.commandFollow(keys, output, 0, done)
+}
+
+func (r *PTYRunner) Keys(keys string) error {
+	seq, err := parseKeySequenceNoEnter(keys)
+	if err != nil {
+		return err
+	}
+
+	r.commandMu.Lock()
+	defer r.commandMu.Unlock()
+
+	_, err = r.file.Write(seq)
+	return err
+}
+
+func (r *PTYRunner) KeysWait(keys string, quietFor time.Duration) (RunResult, error) {
+	return r.keysWait(keys, quietFor, 30*time.Second)
+}
+
+func (r *PTYRunner) KeysFollow(keys string, output io.Writer, done <-chan struct{}) error {
+	return r.keysFollow(keys, output, 0, done)
 }
 
 func (r *PTYRunner) Follow(output io.Writer, done <-chan struct{}) error {
@@ -320,6 +349,60 @@ func (r *PTYRunner) sendFollow(input string, output io.Writer, quietFor time.Dur
 
 func (r *PTYRunner) commandFollow(keys string, output io.Writer, quietFor time.Duration, done <-chan struct{}) error {
 	seq, err := parseKeySequence(keys)
+	if err != nil {
+		return err
+	}
+
+	r.commandMu.Lock()
+
+	sub := r.subscribeBestEffort()
+	if _, err := r.file.Write(seq); err != nil {
+		r.unsubscribe(sub.id)
+		r.commandMu.Unlock()
+		return err
+	}
+	r.commandMu.Unlock()
+	defer r.unsubscribe(sub.id)
+
+	var observed bytes.Buffer
+	err = r.writeSubscription(io.MultiWriter(output, &observed), sub.ch, quietFor, done)
+	if observed.Len() > 0 {
+		r.record(strings.TrimRight(observed.String(), "\n"))
+	}
+	return err
+}
+
+func (r *PTYRunner) keysWait(keys string, quietFor, maxWait time.Duration) (RunResult, error) {
+	seq, err := parseKeySequenceNoEnter(keys)
+	if err != nil {
+		return RunResult{}, err
+	}
+
+	r.commandMu.Lock()
+	defer r.commandMu.Unlock()
+
+	sub := r.subscribeReliable()
+	defer r.unsubscribe(sub.id)
+	if _, err := r.file.Write(seq); err != nil {
+		return RunResult{}, err
+	}
+
+	output, timedOut, err := r.collectUntilQuiet(sub.ch, quietFor, maxWait)
+	if err != nil {
+		return RunResult{}, err
+	}
+	output = cleanTerminalNoise(output)
+	output = trimOutputBoundary(output)
+	result := RunResult{Output: output, ExitCode: 0}
+	if timedOut {
+		result.ExitCode = 124
+	}
+	r.record(result.Output)
+	return result, nil
+}
+
+func (r *PTYRunner) keysFollow(keys string, output io.Writer, quietFor time.Duration, done <-chan struct{}) error {
+	seq, err := parseKeySequenceNoEnter(keys)
 	if err != nil {
 		return err
 	}

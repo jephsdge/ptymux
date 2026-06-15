@@ -6,6 +6,14 @@ import (
 )
 
 func parseKeySequence(sequence string) ([]byte, error) {
+	return parseKeySequenceWithOptions(sequence, true)
+}
+
+func parseKeySequenceNoEnter(sequence string) ([]byte, error) {
+	return parseKeySequenceWithOptions(sequence, false)
+}
+
+func parseKeySequenceWithOptions(sequence string, appendEnter bool) ([]byte, error) {
 	parts := strings.Fields(sequence)
 	if len(parts) == 0 {
 		return nil, fmt.Errorf("empty key sequence")
@@ -17,13 +25,15 @@ func parseKeySequence(sequence string) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, key)
+		out = append(out, key...)
 	}
-	out = append(out, '\r')
+	if appendEnter {
+		out = append(out, '\r')
+	}
 	return out, nil
 }
 
-func parseKeyPress(press string) (byte, error) {
+func parseKeyPress(press string) ([]byte, error) {
 	if len(press) == 1 {
 		return parsePlainKey(press)
 	}
@@ -32,7 +42,7 @@ func parseKeyPress(press string) (byte, error) {
 		key := strings.ToLower(pieces[len(pieces)-1])
 		for _, modifier := range pieces[:len(pieces)-1] {
 			if strings.ToLower(modifier) != "ctrl" {
-				return 0, fmt.Errorf("unsupported key modifier %q in %q", modifier, press)
+				return nil, fmt.Errorf("unsupported key modifier %q in %q", modifier, press)
 			}
 		}
 		return parseCtrlKey(key, press)
@@ -41,29 +51,47 @@ func parseKeyPress(press string) (byte, error) {
 	return parsePlainKey(press)
 }
 
-func parseCtrlKey(key string, press string) (byte, error) {
+func parseCtrlKey(key string, press string) ([]byte, error) {
 	if len(key) != 1 || key[0] < 'a' || key[0] > 'z' {
-		return 0, fmt.Errorf("unsupported ctrl key %q in %q", key, press)
+		return nil, fmt.Errorf("unsupported ctrl key %q in %q", key, press)
 	}
-	return key[0] & 0x1f, nil
+	return []byte{key[0] & 0x1f}, nil
 }
 
-func parsePlainKey(press string) (byte, error) {
+func parsePlainKey(press string) ([]byte, error) {
 	switch strings.ToLower(press) {
 	case "enter":
-		return '\r', nil
+		return []byte{'\r'}, nil
 	case "esc", "escape":
-		return 0x1b, nil
+		return []byte{0x1b}, nil
 	case "tab":
-		return '\t', nil
+		return []byte{'\t'}, nil
 	case "backspace":
-		return 0x7f, nil
+		return []byte{0x7f}, nil
 	case "space":
-		return ' ', nil
+		return []byte{' '}, nil
+	case "up":
+		return []byte("\x1b[A"), nil
+	case "down":
+		return []byte("\x1b[B"), nil
+	case "right":
+		return []byte("\x1b[C"), nil
+	case "left":
+		return []byte("\x1b[D"), nil
+	case "home":
+		return []byte("\x1b[H"), nil
+	case "end":
+		return []byte("\x1b[F"), nil
+	case "delete":
+		return []byte("\x1b[3~"), nil
+	case "pageup":
+		return []byte("\x1b[5~"), nil
+	case "pagedown":
+		return []byte("\x1b[6~"), nil
 	}
 
 	if len(press) == 1 {
-		return press[0], nil
+		return []byte{press[0]}, nil
 	}
-	return 0, fmt.Errorf("unsupported key %q", press)
+	return nil, fmt.Errorf("unsupported key %q", press)
 }

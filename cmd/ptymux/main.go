@@ -26,7 +26,7 @@ func main() {
 	}
 
 	switch cfg.Action {
-	case app.ActionRun, app.ActionIdle, app.ActionSend, app.ActionCommand, app.ActionRead:
+	case app.ActionRun, app.ActionIdle, app.ActionSend, app.ActionText, app.ActionCommand, app.ActionKeys, app.ActionRead:
 		fmt.Print(resp.Output)
 		if resp.Output != "" && resp.Output[len(resp.Output)-1] != '\n' {
 			fmt.Println()

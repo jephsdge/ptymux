@@ -42,7 +42,9 @@ Use target paths consistently so later commands reuse the intended shell state.
 ptymux [--socket PATH] <target> <command>
 ptymux [--socket PATH] idle [-t DURATION] <target> <input>
 ptymux [--socket PATH] send [-f | -t DURATION] <target> <input>
+ptymux [--socket PATH] text <target> <text>
 ptymux [--socket PATH] command [-f | -t DURATION] <target> <keys>
+ptymux [--socket PATH] keys [-f | -t DURATION] <target> <keys>
 ptymux [--socket PATH] read [-n N] <target>
 ptymux [--socket PATH] follow <target>
 ptymux [--socket PATH] list [target]
@@ -106,7 +108,7 @@ Durations without a unit are milliseconds. `-f` and `-t` are mutually exclusive.
 
 ## Command Mode
 
-Send terminal key sequences:
+Send terminal key sequences and automatically press Enter at the end:
 
 ```sh
 ptymux command work "ctrl-c"
@@ -118,6 +120,28 @@ ptymux command -f work "ctrl-o d"
 Spaces mean sequential key presses. Hyphens combine modifiers with a key. `ptymux` appends Enter after the sequence. For example, `ctrl-o d` sends Ctrl+O, then `d`, then Enter.
 
 Supported named keys include `enter`, `esc`, `escape`, `tab`, `backspace`, and `space`.
+
+## Text And Keys
+
+Type literal text without pressing Enter:
+
+```sh
+ptymux text work "hello"
+ptymux keys work "enter"
+```
+
+Send exact key sequences without an implicit Enter:
+
+```sh
+ptymux keys work "ctrl-c"
+ptymux keys work "up enter"
+ptymux keys -t 500ms work "ctrl-c"
+ptymux keys -f work "pageup"
+```
+
+Supported named keys include `enter`, `esc`, `escape`, `tab`, `backspace`,
+`space`, `up`, `down`, `left`, `right`, `home`, `end`, `delete`, `pageup`, and
+`pagedown`.
 
 ## Ctrl+C
 

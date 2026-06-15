@@ -175,7 +175,8 @@ visible in process listings.
 
 ### Command Mode
 
-Use `command` to send terminal key sequences:
+Use `command` to send terminal key sequences and automatically press Enter at
+the end:
 
 ```sh
 ptymux command work "ctrl-c"
@@ -192,8 +193,32 @@ Supported named keys include `enter`, `esc`, `escape`, `tab`, `backspace`, and
 `space`. `-f` and `-t` behave like `send`: follow until interrupted, or wait
 until output has been quiet for the requested duration.
 
-Use `command` for new key-sequence automation. The legacy `ctrl-c` command
-remains as a compatibility alias.
+### Text And Keys
+
+Use `text` to type literal text without pressing Enter:
+
+```sh
+ptymux text work "hello"
+ptymux keys work "enter"
+```
+
+Use `keys` to send key sequences without an implicit Enter:
+
+```sh
+ptymux keys work "ctrl-c"
+ptymux keys work "up enter"
+ptymux keys -t 500ms work "ctrl-c"
+ptymux keys -f work "pageup"
+```
+
+Supported named keys include `enter`, `esc`, `escape`, `tab`, `backspace`,
+`space`, `up`, `down`, `left`, `right`, `home`, `end`, `delete`, `pageup`, and
+`pagedown`.
+
+Prefer `text` and `keys` for programmable interaction because they do exactly
+what their names say. `command` remains available when the desired behavior is
+"send these keys, then press Enter". The legacy `ctrl-c` command remains as a
+compatibility alias.
 
 ### Ctrl+C
 

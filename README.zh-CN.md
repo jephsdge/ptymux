@@ -170,7 +170,7 @@ ptymux send work "your-password"
 
 ### Command 模式
 
-`command` 用于发送终端按键序列：
+`command` 用于发送终端按键序列，并在结尾自动按 Enter：
 
 ```sh
 ptymux command work "ctrl-c"
@@ -185,7 +185,31 @@ ptymux command -f work "ctrl-o d"
 支持的命名按键包括 `enter`、`esc`、`escape`、`tab`、`backspace` 和 `space`。
 `-f` 和 `-t` 的行为与 `send` 一样：持续 follow，或等待输出静默指定时间。
 
-新用法推荐 `command`。旧的 `ctrl-c` 命令作为兼容别名保留。
+### Text 和 Keys
+
+`text` 用于输入原始文本，不会自动按 Enter：
+
+```sh
+ptymux text work "hello"
+ptymux keys work "enter"
+```
+
+`keys` 用于发送按键序列，也不会隐式追加 Enter：
+
+```sh
+ptymux keys work "ctrl-c"
+ptymux keys work "up enter"
+ptymux keys -t 500ms work "ctrl-c"
+ptymux keys -f work "pageup"
+```
+
+支持的命名按键包括 `enter`、`esc`、`escape`、`tab`、`backspace`、`space`、
+`up`、`down`、`left`、`right`、`home`、`end`、`delete`、`pageup` 和
+`pagedown`。
+
+可编程交互优先使用 `text` 和 `keys`，因为它们只做名字表达的动作。需要“发送
+这些按键，然后按 Enter”时继续使用 `command`。旧的 `ctrl-c` 命令作为兼容别名
+保留。
 
 ### Ctrl+C
 

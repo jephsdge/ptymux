@@ -61,6 +61,28 @@ func TestParseKeySequence(t *testing.T) {
 	}
 }
 
+func TestParseKeySequenceNoEnter(t *testing.T) {
+	got, err := parseKeySequenceNoEnter("ctrl-c")
+	if err != nil {
+		t.Fatalf("parseKeySequenceNoEnter returned error: %v", err)
+	}
+	want := []byte{3}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("parseKeySequenceNoEnter(\"ctrl-c\") = %v, want %v", got, want)
+	}
+}
+
+func TestParseKeySequenceSupportsNavigationKeys(t *testing.T) {
+	got, err := parseKeySequenceNoEnter("up enter left delete")
+	if err != nil {
+		t.Fatalf("parseKeySequenceNoEnter returned error: %v", err)
+	}
+	want := []byte("\x1b[A\r\x1b[D\x1b[3~")
+	if !bytes.Equal(got, want) {
+		t.Fatalf("parseKeySequenceNoEnter(\"up enter left delete\") = %v, want %v", got, want)
+	}
+}
+
 func TestParseKeySequenceRejectsUnsupportedModifier(t *testing.T) {
 	_, err := parseKeySequence("alt-x")
 	if err == nil {
@@ -76,7 +98,7 @@ func TestParseKeySequenceRejectsEmptySequence(t *testing.T) {
 }
 
 func TestParseKeySequenceRejectsUnsupportedKey(t *testing.T) {
-	_, err := parseKeySequence("delete")
+	_, err := parseKeySequence("f13")
 	if err == nil {
 		t.Fatal("parseKeySequence returned nil error, want unsupported key error")
 	}

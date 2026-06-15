@@ -262,6 +262,156 @@ func TestParseSendRequiresTargetAndInput(t *testing.T) {
 	}
 }
 
+func TestParseTextTargetPath(t *testing.T) {
+	cfg, err := Parse([]string{"text", "work/main", "hello world"})
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+
+	if cfg.Action != ActionText {
+		t.Fatalf("Action = %q, want %q", cfg.Action, ActionText)
+	}
+	if cfg.Session != "work" || cfg.Pane != "main" || cfg.Tab != "default" {
+		t.Fatalf("target = %q/%q/%q, want work/main/default", cfg.Session, cfg.Pane, cfg.Tab)
+	}
+	if cfg.Command != "hello world" {
+		t.Fatalf("Command = %q, want hello world", cfg.Command)
+	}
+}
+
+func TestParseTextDirectSocketFlag(t *testing.T) {
+	cfg, err := Parse([]string{"text", "--socket", "/tmp/ptymux.sock", "work", "hello"})
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+
+	if cfg.Action != ActionText {
+		t.Fatalf("Action = %q, want %q", cfg.Action, ActionText)
+	}
+	if cfg.Socket != "/tmp/ptymux.sock" {
+		t.Fatalf("Socket = %q, want /tmp/ptymux.sock", cfg.Socket)
+	}
+	if cfg.Session != "work" || cfg.Command != "hello" {
+		t.Fatalf("target/command = %q/%q, want work/hello", cfg.Session, cfg.Command)
+	}
+}
+
+func TestParseTextGlobalSocketFlag(t *testing.T) {
+	cfg, err := Parse([]string{"--socket", "/tmp/ptymux.sock", "text", "work", "hello"})
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+
+	if cfg.Action != ActionText {
+		t.Fatalf("Action = %q, want %q", cfg.Action, ActionText)
+	}
+	if cfg.Socket != "/tmp/ptymux.sock" {
+		t.Fatalf("Socket = %q, want /tmp/ptymux.sock", cfg.Socket)
+	}
+	if cfg.Session != "work" || cfg.Command != "hello" {
+		t.Fatalf("target/command = %q/%q, want work/hello", cfg.Session, cfg.Command)
+	}
+}
+
+func TestParseTextRequiresTargetAndText(t *testing.T) {
+	if _, err := Parse([]string{"text", "work"}); err == nil {
+		t.Fatal("Parse returned nil error, want error")
+	}
+}
+
+func TestParseKeysTargetPath(t *testing.T) {
+	cfg, err := Parse([]string{"keys", "work/main", "up enter"})
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+
+	if cfg.Action != ActionKeys {
+		t.Fatalf("Action = %q, want %q", cfg.Action, ActionKeys)
+	}
+	if cfg.Session != "work" || cfg.Pane != "main" || cfg.Tab != "default" {
+		t.Fatalf("target = %q/%q/%q, want work/main/default", cfg.Session, cfg.Pane, cfg.Tab)
+	}
+	if cfg.Command != "up enter" {
+		t.Fatalf("Command = %q, want up enter", cfg.Command)
+	}
+}
+
+func TestParseKeysDirectSocketFlag(t *testing.T) {
+	cfg, err := Parse([]string{"keys", "--socket", "/tmp/ptymux.sock", "work", "ctrl-c"})
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+
+	if cfg.Action != ActionKeys {
+		t.Fatalf("Action = %q, want %q", cfg.Action, ActionKeys)
+	}
+	if cfg.Socket != "/tmp/ptymux.sock" {
+		t.Fatalf("Socket = %q, want /tmp/ptymux.sock", cfg.Socket)
+	}
+	if cfg.Session != "work" || cfg.Command != "ctrl-c" {
+		t.Fatalf("target/command = %q/%q, want work/ctrl-c", cfg.Session, cfg.Command)
+	}
+}
+
+func TestParseKeysGlobalSocketFlag(t *testing.T) {
+	cfg, err := Parse([]string{"--socket", "/tmp/ptymux.sock", "keys", "work", "ctrl-c"})
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+
+	if cfg.Action != ActionKeys {
+		t.Fatalf("Action = %q, want %q", cfg.Action, ActionKeys)
+	}
+	if cfg.Socket != "/tmp/ptymux.sock" {
+		t.Fatalf("Socket = %q, want /tmp/ptymux.sock", cfg.Socket)
+	}
+	if cfg.Session != "work" || cfg.Command != "ctrl-c" {
+		t.Fatalf("target/command = %q/%q, want work/ctrl-c", cfg.Session, cfg.Command)
+	}
+}
+
+func TestParseKeysWaitAndFollow(t *testing.T) {
+	waitCfg, err := Parse([]string{"keys", "-t", "500ms", "work", "ctrl-d"})
+	if err != nil {
+		t.Fatalf("Parse wait returned error: %v", err)
+	}
+	if waitCfg.Action != ActionKeys {
+		t.Fatalf("wait Action = %q, want %q", waitCfg.Action, ActionKeys)
+	}
+	if waitCfg.Follow {
+		t.Fatal("wait Follow = true, want false")
+	}
+	if waitCfg.Wait != 500*time.Millisecond {
+		t.Fatalf("wait Wait = %s, want 500ms", waitCfg.Wait)
+	}
+	if waitCfg.Session != "work" || waitCfg.Command != "ctrl-d" {
+		t.Fatalf("wait target/command = %q/%q, want work/ctrl-d", waitCfg.Session, waitCfg.Command)
+	}
+
+	followCfg, err := Parse([]string{"keys", "-f", "work", "ctrl-c"})
+	if err != nil {
+		t.Fatalf("Parse follow returned error: %v", err)
+	}
+	if followCfg.Action != ActionKeys {
+		t.Fatalf("follow Action = %q, want %q", followCfg.Action, ActionKeys)
+	}
+	if !followCfg.Follow {
+		t.Fatal("follow Follow = false, want true")
+	}
+	if followCfg.Wait != 0 {
+		t.Fatalf("follow Wait = %s, want 0", followCfg.Wait)
+	}
+	if followCfg.Session != "work" || followCfg.Command != "ctrl-c" {
+		t.Fatalf("follow target/command = %q/%q, want work/ctrl-c", followCfg.Session, followCfg.Command)
+	}
+}
+
+func TestParseKeysRejectsFollowAndWait(t *testing.T) {
+	if _, err := Parse([]string{"keys", "-f", "-t", "1s", "work", "ctrl-c"}); err == nil {
+		t.Fatal("Parse returned nil error, want conflict error")
+	}
+}
+
 func TestParseCommand(t *testing.T) {
 	cfg, err := Parse([]string{"command", "work/main", "ctrl-o d"})
 	if err != nil {

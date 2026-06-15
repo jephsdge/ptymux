@@ -268,6 +268,63 @@ func TestDaemonHandleCommandWaitRoutesToRunner(t *testing.T) {
 	}
 }
 
+func TestDaemonHandleTextRoutesToRunner(t *testing.T) {
+	daemon := NewDaemon("")
+	runner := &fakeRunner{}
+	daemon.store.GetOrCreate("session1", "pane1", "tab1", func() Runner {
+		return runner
+	})
+
+	resp := daemon.Handle(Request{Action: "text", Session: "session1", Pane: "pane1", Tab: "tab1", Command: "hello"})
+
+	if resp.Error != "" {
+		t.Fatalf("text returned error: %s", resp.Error)
+	}
+	if runner.text != "hello" {
+		t.Fatalf("runner text = %q, want hello", runner.text)
+	}
+}
+
+func TestDaemonHandleKeysRoutesToRunner(t *testing.T) {
+	daemon := NewDaemon("")
+	runner := &fakeRunner{}
+	daemon.store.GetOrCreate("session1", "pane1", "tab1", func() Runner {
+		return runner
+	})
+
+	resp := daemon.Handle(Request{Action: "keys", Session: "session1", Pane: "pane1", Tab: "tab1", Command: "left enter"})
+
+	if resp.Error != "" {
+		t.Fatalf("keys returned error: %s", resp.Error)
+	}
+	if runner.keys != "left enter" {
+		t.Fatalf("runner keys = %q, want left enter", runner.keys)
+	}
+}
+
+func TestDaemonHandleKeysWaitRoutesToRunner(t *testing.T) {
+	daemon := NewDaemon("")
+	runner := &fakeRunner{keysWaitResult: RunResult{Output: "keys waited", ExitCode: 0}}
+	daemon.store.GetOrCreate("session1", "pane1", "tab1", func() Runner {
+		return runner
+	})
+
+	resp := daemon.Handle(Request{Action: "keys", Session: "session1", Pane: "pane1", Tab: "tab1", Command: "ctrl-c", WaitMillis: 25})
+
+	if resp.Error != "" {
+		t.Fatalf("keys wait returned error: %s", resp.Error)
+	}
+	if runner.keysWait != "ctrl-c" {
+		t.Fatalf("runner keysWait = %q, want ctrl-c", runner.keysWait)
+	}
+	if runner.keysWaitQuiet != 25*time.Millisecond {
+		t.Fatalf("quiet = %v, want 25ms", runner.keysWaitQuiet)
+	}
+	if resp.Output != "keys waited" {
+		t.Fatalf("Output = %q, want keys waited", resp.Output)
+	}
+}
+
 func TestDaemonHandleStreamCommandUsesCommandFollowAndCtrlCUsesCtrlCFollow(t *testing.T) {
 	daemon := NewDaemon("")
 	runner := &fakeRunner{}
@@ -294,12 +351,44 @@ func TestDaemonHandleStreamCommandUsesCommandFollowAndCtrlCUsesCtrlCFollow(t *te
 	if !strings.Contains(ctrlCConn.String(), "ctrl-c followed") {
 		t.Fatalf("streamed output = %q, want ctrl-c follow output", ctrlCConn.String())
 	}
+
+	keysConn := newStreamTestConn(nil)
+	daemon.handleStream(keysConn, Request{Action: "keys", Session: "session1", Pane: "pane1", Tab: "tab1", Command: "left enter", Follow: true})
+
+	if runner.keysFollow != "left enter" {
+		t.Fatalf("runner keysFollow = %q, want left enter", runner.keysFollow)
+	}
+	if !strings.Contains(keysConn.String(), "keys followed left enter") {
+		t.Fatalf("streamed output = %q, want keys follow output", keysConn.String())
+	}
 }
 
 func TestDaemonHandleStreamCommandRejectsInvalidKeysBeforeCreatingTarget(t *testing.T) {
 	daemon := NewDaemon("")
 	var input bytes.Buffer
 	if err := json.NewEncoder(&input).Encode(Request{Action: "command", Session: "session1", Pane: "pane1", Tab: "tab1", Command: "alt-x", Follow: true}); err != nil {
+		t.Fatalf("encode request returned error: %v", err)
+	}
+	conn := newStreamTestConn(input.Bytes())
+
+	daemon.handle(conn)
+
+	var resp Response
+	if err := json.NewDecoder(strings.NewReader(conn.String())).Decode(&resp); err != nil {
+		t.Fatalf("decode response returned error: %v", err)
+	}
+	if resp.Error == "" {
+		t.Fatal("Error is empty, want invalid key error")
+	}
+	if got := daemon.store.Snapshot(); len(got.Sessions) != 0 {
+		t.Fatalf("snapshot = %+v, want no created targets", got)
+	}
+}
+
+func TestDaemonHandleStreamKeysRejectsInvalidKeysBeforeCreatingTarget(t *testing.T) {
+	daemon := NewDaemon("")
+	var input bytes.Buffer
+	if err := json.NewEncoder(&input).Encode(Request{Action: "keys", Session: "session1", Pane: "pane1", Tab: "tab1", Command: "alt-x", Follow: true}); err != nil {
 		t.Fatalf("encode request returned error: %v", err)
 	}
 	conn := newStreamTestConn(input.Bytes())
@@ -358,11 +447,17 @@ func (a testAddr) String() string  { return string(a) }
 
 type fakeRunner struct {
 	closed            bool
+	text              string
 	command           string
 	commandWait       string
 	commandWaitQuiet  time.Duration
 	commandWaitResult RunResult
 	commandFollow     string
+	keys              string
+	keysWait          string
+	keysWaitQuiet     time.Duration
+	keysWaitResult    RunResult
+	keysFollow        string
 	ctrlCFollow       bool
 }
 
@@ -375,6 +470,10 @@ func (f *fakeRunner) SendWait(string, time.Duration) (RunResult, error) {
 	return RunResult{}, nil
 }
 func (f *fakeRunner) SendFollow(string, io.Writer, <-chan struct{}) error {
+	return nil
+}
+func (f *fakeRunner) Text(input string) error {
+	f.text = input
 	return nil
 }
 func (f *fakeRunner) Follow(io.Writer, <-chan struct{}) error {
@@ -397,6 +496,20 @@ func (f *fakeRunner) CommandWait(keys string, quietFor time.Duration) (RunResult
 func (f *fakeRunner) CommandFollow(keys string, output io.Writer, done <-chan struct{}) error {
 	f.commandFollow = keys
 	_, _ = io.WriteString(output, "followed "+keys)
+	return nil
+}
+func (f *fakeRunner) Keys(keys string) error {
+	f.keys = keys
+	return nil
+}
+func (f *fakeRunner) KeysWait(keys string, quietFor time.Duration) (RunResult, error) {
+	f.keysWait = keys
+	f.keysWaitQuiet = quietFor
+	return f.keysWaitResult, nil
+}
+func (f *fakeRunner) KeysFollow(keys string, output io.Writer, done <-chan struct{}) error {
+	f.keysFollow = keys
+	_, _ = io.WriteString(output, "keys followed "+keys)
 	return nil
 }
 func (f *fakeRunner) Read(int) (RunResult, error) {
