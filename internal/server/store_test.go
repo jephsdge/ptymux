@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -54,6 +56,22 @@ func TestDaemonStopClosesTabs(t *testing.T) {
 	}
 	if !waitStopped(daemon, 200*time.Millisecond) {
 		t.Fatal("daemon was not marked stopped")
+	}
+}
+
+func TestPrepareSocketPathCreatesSocketDirectory(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), ".ptymux", "sockets", "ptymux-default.sock")
+
+	if err := prepareSocketPath(socketPath); err != nil {
+		t.Fatalf("prepareSocketPath returned error: %v", err)
+	}
+
+	info, err := os.Stat(filepath.Dir(socketPath))
+	if err != nil {
+		t.Fatalf("Stat returned error: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("%s is not a directory", filepath.Dir(socketPath))
 	}
 }
 
@@ -131,6 +149,82 @@ func TestDaemonKillTargetClosesOnlyTarget(t *testing.T) {
 	}
 	if got := daemon.store.SnapshotTarget("work", "", ""); len(got.Sessions) != 0 {
 		t.Fatalf("work snapshot = %+v, want removed target", got)
+	}
+}
+
+func TestDaemonCleanupClosesIdleTargets(t *testing.T) {
+	now := time.Date(2026, 6, 15, 10, 0, 0, 0, time.UTC)
+	daemon := NewDaemonWithOptions("", DaemonOptions{
+		AutoRelease: AutoReleaseOptions{
+			Enabled:           true,
+			TargetIdleTimeout: 8 * time.Hour,
+			DaemonIdleTimeout: 30 * time.Minute,
+		},
+	})
+	idleRunner := &fakeRunner{}
+	activeRunner := &fakeRunner{}
+	idleTab := daemon.store.GetOrCreate("idle", "default", "default", func() Runner {
+		return idleRunner
+	})
+	activeTab := daemon.store.GetOrCreate("active", "default", "default", func() Runner {
+		return activeRunner
+	})
+	idleTab.LastUsedAt = now.Add(-9 * time.Hour)
+	activeTab.LastUsedAt = now.Add(-7 * time.Hour)
+
+	daemon.cleanupIdle(now)
+
+	if !idleRunner.closed {
+		t.Fatal("idle runner was not closed")
+	}
+	if activeRunner.closed {
+		t.Fatal("active runner was closed")
+	}
+	if got := daemon.store.SnapshotTarget("idle", "", ""); len(got.Sessions) != 0 {
+		t.Fatalf("idle snapshot = %+v, want removed target", got)
+	}
+	if got := daemon.store.SnapshotTarget("active", "", ""); len(got.Sessions) != 1 {
+		t.Fatalf("active snapshot = %+v, want active target to remain", got)
+	}
+}
+
+func TestDaemonCleanupStopsEmptyIdleDaemon(t *testing.T) {
+	now := time.Date(2026, 6, 15, 10, 0, 0, 0, time.UTC)
+	daemon := NewDaemonWithOptions("", DaemonOptions{
+		AutoRelease: AutoReleaseOptions{
+			Enabled:           true,
+			TargetIdleTimeout: 8 * time.Hour,
+			DaemonIdleTimeout: 30 * time.Minute,
+		},
+	})
+	daemon.lastActivity = now.Add(-31 * time.Minute)
+
+	daemon.cleanupIdle(now)
+
+	if !daemon.Stopped() {
+		t.Fatal("daemon was not marked stopped")
+	}
+}
+
+func TestDaemonCleanupKeepsNonEmptyDaemonPastDaemonTimeout(t *testing.T) {
+	now := time.Date(2026, 6, 15, 10, 0, 0, 0, time.UTC)
+	daemon := NewDaemonWithOptions("", DaemonOptions{
+		AutoRelease: AutoReleaseOptions{
+			Enabled:           true,
+			TargetIdleTimeout: 8 * time.Hour,
+			DaemonIdleTimeout: 30 * time.Minute,
+		},
+	})
+	daemon.lastActivity = now.Add(-31 * time.Minute)
+	tab := daemon.store.GetOrCreate("work", "default", "default", func() Runner {
+		return &fakeRunner{}
+	})
+	tab.LastUsedAt = now.Add(-7 * time.Hour)
+
+	daemon.cleanupIdle(now)
+
+	if daemon.Stopped() {
+		t.Fatal("daemon was stopped while a target remained")
 	}
 }
 

@@ -35,13 +35,21 @@ prefer the word `target`.
 - `internal/app/client.go`
   Client-side daemon communication. Starts the daemon automatically when needed.
   Streaming commands use a Unix socket stream instead of JSON response decoding.
+  The default socket is `~/.ptymux/sockets/ptymux-default.sock`.
+
+- `internal/app/config.go`
+  Loads optional user configuration from `~/.ptymux/config.json`. Defaults
+  enable automatic release with an 8h target idle timeout and a 30m empty daemon
+  idle timeout.
 
 - `internal/server/daemon.go`
   Unix socket server. Decodes requests, locates/creates target runners, and
-  dispatches actions.
+  dispatches actions. Owns automatic release scheduling for idle targets and
+  empty daemons.
 
 - `internal/server/store.go`
-  In-memory session/pane/tab target store. Targets are created lazily.
+  In-memory session/pane/tab target store. Targets are created lazily and track
+  last-used time plus active use counts for automatic release.
 
 - `internal/server/tab.go`
   Core PTY runner. Each runner owns one shell process, one PTY, one background
@@ -135,6 +143,13 @@ Locking rules:
   Closes one target, removes it from the store, and leaves the daemon running.
   `ptymux kill` without a target remains a compatibility path for closing all
   targets.
+
+- Auto release:
+  `~/.ptymux/config.json`
+  Defaults to enabled. `target_idle_timeout` defaults to `8h` and releases idle
+  targets. `daemon_idle_timeout` defaults to `30m` and stops an empty idle
+  daemon, which removes its socket. A timeout of `0` disables that specific
+  release behavior.
 
 - Help:
   `ptymux -h`, `ptymux --help`, `ptymux help`, and subcommand help flags such

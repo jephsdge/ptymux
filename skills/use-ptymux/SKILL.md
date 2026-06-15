@@ -76,10 +76,15 @@ ptymux stop
 ## Operating Rules
 
 - Keep target names stable within a task so shell state is reused intentionally.
+- Remember that the default socket is
+  `~/.ptymux/sockets/ptymux-default.sock`.
 - Use a task-specific socket when isolation matters: `ptymux --socket /tmp/name.sock ...`.
 - Stop a temporary daemon when done: `ptymux --socket /tmp/name.sock stop`.
 - Use `ptymux kill <target>` to release one target while keeping the daemon
   alive.
+- Remember that `~/.ptymux/config.json` controls automatic target and daemon
+  release; defaults are enabled with `target_idle_timeout` of `8h` and
+  `daemon_idle_timeout` of `30m`.
 - Remember that PTY output combines stdout and stderr, like a normal terminal.
 - Treat `idle` and `send -t` as quiet-output heuristics; delayed output may arrive after the command returns.
 - Do not rely on `read -n` as full scrollback; it reads recent command regions from the virtual terminal screen.

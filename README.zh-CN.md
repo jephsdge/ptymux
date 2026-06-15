@@ -279,8 +279,10 @@ ptymux kill work
 默认 socket 路径是：
 
 ```text
-/tmp/ptymux-<uid>.sock
+~/.ptymux/sockets/ptymux-default.sock
 ```
+
+daemon 启动时，`ptymux` 会自动创建 `~/.ptymux/sockets` 目录。
 
 如果你想使用独立 daemon，可以指定 socket：
 
@@ -288,6 +290,38 @@ ptymux kill work
 ptymux --socket /tmp/project-a.sock work "pwd"
 ptymux --socket /tmp/project-a.sock stop
 ```
+
+## 配置
+
+`ptymux` 会读取下面的可选用户配置：
+
+```text
+~/.ptymux/config.json
+```
+
+默认配置：
+
+```json
+{
+  "auto_release": {
+    "enabled": true,
+    "target_idle_timeout": "8h",
+    "daemon_idle_timeout": "30m"
+  }
+}
+```
+
+`target_idle_timeout` 表示 target 多久没有被使用后自动释放。释放 target
+会关闭它的 shell，并丢失该 target 的当前目录、环境变量和交互状态。
+
+`daemon_idle_timeout` 表示空 daemon 多久没有客户端请求后自动退出。daemon
+退出后会删除 socket。下一次执行 `ptymux` 命令时会自动启动新的 daemon。
+
+把某个 timeout 设置为 `"0"` 可以单独关闭对应的释放行为；把 `enabled`
+设置为 `false` 可以完全关闭自动释放。
+
+配置会在 daemon 启动时读取。如果要让已经运行的 daemon 使用新配置，先执行
+`ptymux stop` 重启 daemon。
 
 ## 说明
 

@@ -396,14 +396,14 @@ ptymux - persistent command-line PTY targets
 
 Usage:
   ptymux [--socket PATH] <target> <command>
-  ptymux idle [-t DURATION] [--socket PATH] <target> <input>
-  ptymux send [-f | -t DURATION] [--socket PATH] <target> <input>
-  ptymux command [-f | -t DURATION] [--socket PATH] <target> <keys>
-  ptymux read [-n N] <target>
-  ptymux follow <target>
-  ptymux list [target]
-  ptymux kill [target]
-  ptymux stop
+  ptymux [--socket PATH] idle [-t DURATION] <target> <input>
+  ptymux [--socket PATH] send [-f | -t DURATION] <target> <input>
+  ptymux [--socket PATH] command [-f | -t DURATION] <target> <keys>
+  ptymux [--socket PATH] read [-n N] <target>
+  ptymux [--socket PATH] follow <target>
+  ptymux [--socket PATH] list [target]
+  ptymux [--socket PATH] kill [target]
+  ptymux [--socket PATH] stop
   ptymux -h | --help | help
 
 Targets:
@@ -425,6 +425,15 @@ Options:
   -f               follow output until interrupted
   -t DURATION      wait until PTY output is quiet; bare numbers are ms
   -n N             read the recent N terminal command regions
+
+Default socket:
+  ~/.ptymux/sockets/ptymux-default.sock
+
+Config:
+  ~/.ptymux/config.json
+  auto_release.enabled defaults to true
+  auto_release.target_idle_timeout defaults to 8h
+  auto_release.daemon_idle_timeout defaults to 30m
 `, "\n")
 }
 

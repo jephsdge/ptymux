@@ -40,14 +40,14 @@ Use target paths consistently so later commands reuse the intended shell state.
 
 ```sh
 ptymux [--socket PATH] <target> <command>
-ptymux idle [-t DURATION] [--socket PATH] <target> <input>
-ptymux send [-f | -t DURATION] [--socket PATH] <target> <input>
-ptymux command [-f | -t DURATION] [--socket PATH] <target> <keys>
-ptymux read [-n N] <target>
-ptymux follow <target>
-ptymux list [target]
-ptymux kill [target]
-ptymux stop
+ptymux [--socket PATH] idle [-t DURATION] <target> <input>
+ptymux [--socket PATH] send [-f | -t DURATION] <target> <input>
+ptymux [--socket PATH] command [-f | -t DURATION] <target> <keys>
+ptymux [--socket PATH] read [-n N] <target>
+ptymux [--socket PATH] follow <target>
+ptymux [--socket PATH] list [target]
+ptymux [--socket PATH] kill [target]
+ptymux [--socket PATH] stop
 ptymux -h | --help | help
 ```
 
@@ -181,8 +181,11 @@ managed targets as a compatibility behavior.
 `ptymux` starts its daemon automatically when needed. The default socket path is:
 
 ```text
-/tmp/ptymux-<uid>.sock
+~/.ptymux/sockets/ptymux-default.sock
 ```
+
+`ptymux` creates the `~/.ptymux/sockets` directory automatically when the daemon
+starts.
 
 Use a custom socket for isolation:
 
@@ -196,3 +199,28 @@ Stop the default daemon and close all managed shells:
 ```sh
 ptymux stop
 ```
+
+## Auto Release
+
+`ptymux` reads optional user configuration from:
+
+```text
+~/.ptymux/config.json
+```
+
+Default configuration:
+
+```json
+{
+  "auto_release": {
+    "enabled": true,
+    "target_idle_timeout": "8h",
+    "daemon_idle_timeout": "30m"
+  }
+}
+```
+
+`target_idle_timeout` releases a target after it has not been used for the
+configured duration. `daemon_idle_timeout` stops an empty daemon after it has no
+client requests for the configured duration. Set a timeout to `"0"` to disable
+that release behavior, or set `enabled` to `false` to disable auto release.

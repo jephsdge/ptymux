@@ -7,27 +7,54 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
 
 type Daemon struct {
-	store    *Store
-	shell    string
-	listener net.Listener
-	stopOnce sync.Once
-	stopped  chan struct{}
+	store        *Store
+	shell        string
+	listener     net.Listener
+	stopOnce     sync.Once
+	stopped      chan struct{}
+	options      DaemonOptions
+	activityMu   sync.Mutex
+	lastActivity time.Time
+}
+
+type DaemonOptions struct {
+	AutoRelease AutoReleaseOptions
+}
+
+type AutoReleaseOptions struct {
+	Enabled           bool
+	TargetIdleTimeout time.Duration
+	DaemonIdleTimeout time.Duration
+	SweepInterval     time.Duration
 }
 
 func NewDaemon(shell string) *Daemon {
-	return &Daemon{store: NewStore(), shell: shell, stopped: make(chan struct{})}
+	return NewDaemonWithOptions(shell, DaemonOptions{})
+}
+
+func NewDaemonWithOptions(shell string, options DaemonOptions) *Daemon {
+	return &Daemon{
+		store:        NewStore(),
+		shell:        shell,
+		stopped:      make(chan struct{}),
+		options:      options,
+		lastActivity: time.Now(),
+	}
 }
 
 func (d *Daemon) Serve(socketPath string) error {
 	if socketPath == "" {
 		return errors.New("missing socket path")
 	}
-	_ = os.Remove(socketPath)
+	if err := prepareSocketPath(socketPath); err != nil {
+		return err
+	}
 
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
@@ -37,6 +64,7 @@ func (d *Daemon) Serve(socketPath string) error {
 	defer listener.Close()
 	defer os.Remove(socketPath)
 	defer d.store.CloseAll()
+	d.startCleanupLoop()
 
 	for {
 		conn, err := listener.Accept()
@@ -52,6 +80,14 @@ func (d *Daemon) Serve(socketPath string) error {
 	}
 }
 
+func prepareSocketPath(socketPath string) error {
+	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
+		return err
+	}
+	_ = os.Remove(socketPath)
+	return nil
+}
+
 func (d *Daemon) handle(conn net.Conn) {
 	defer conn.Close()
 
@@ -60,6 +96,7 @@ func (d *Daemon) handle(conn net.Conn) {
 		_ = json.NewEncoder(conn).Encode(Response{Error: err.Error()})
 		return
 	}
+	d.markActivity()
 	if req.Action == "follow" || req.Action == "ctrl-c" || (req.Action == "send" && req.Follow) || (req.Action == "command" && req.Follow) {
 		if req.Action == "command" {
 			if _, err := parseKeySequence(req.Command); err != nil {
@@ -76,58 +113,54 @@ func (d *Daemon) handle(conn net.Conn) {
 }
 
 func (d *Daemon) handleStream(conn net.Conn, req Request) {
-	done := make(chan struct{})
+	clientDone := make(chan struct{})
 	go func() {
 		_, _ = io.Copy(io.Discard, conn)
-		close(done)
+		close(clientDone)
 	}()
 
-	tab := d.store.GetOrCreate(req.Session, req.Pane, req.Tab, func() Runner {
-		runner, err := NewPTYRunner(d.shell)
-		if err != nil {
-			return &errorRunner{err: err}
-		}
-		return runner
-	})
+	tab, finish := d.beginTargetUse(req)
+	defer finish()
 	var err error
 	switch req.Action {
 	case "ctrl-c":
-		err = tab.Runner.CtrlCFollow(conn, done)
+		err = tab.Runner.CtrlCFollow(conn, clientDone)
 	case "follow":
-		err = tab.Runner.Follow(conn, done)
+		err = tab.Runner.Follow(conn, clientDone)
 	case "command":
-		err = tab.Runner.CommandFollow(req.Command, conn, done)
+		err = tab.Runner.CommandFollow(req.Command, conn, clientDone)
 	default:
-		err = tab.Runner.SendFollow(req.Command, conn, done)
+		err = tab.Runner.SendFollow(req.Command, conn, clientDone)
 	}
 	if err != nil {
 		_, _ = io.WriteString(conn, err.Error()+"\n")
 	}
 }
 
+func (d *Daemon) beginTargetUse(req Request) (*Tab, func()) {
+	return d.store.BeginUse(req.Session, req.Pane, req.Tab, func() Runner {
+		runner, err := NewPTYRunner(d.shell)
+		if err != nil {
+			return &errorRunner{err: err}
+		}
+		return runner
+	})
+}
+
 func (d *Daemon) Handle(req Request) Response {
+	d.markActivity()
 	switch req.Action {
 	case "run":
-		tab := d.store.GetOrCreate(req.Session, req.Pane, req.Tab, func() Runner {
-			runner, err := NewPTYRunner(d.shell)
-			if err != nil {
-				return &errorRunner{err: err}
-			}
-			return runner
-		})
+		tab, done := d.beginTargetUse(req)
+		defer done()
 		result, err := tab.Runner.Run(req.Command)
 		if err != nil {
 			return Response{Error: err.Error()}
 		}
 		return Response{Output: result.Output, ExitCode: result.ExitCode}
 	case "idle":
-		tab := d.store.GetOrCreate(req.Session, req.Pane, req.Tab, func() Runner {
-			runner, err := NewPTYRunner(d.shell)
-			if err != nil {
-				return &errorRunner{err: err}
-			}
-			return runner
-		})
+		tab, done := d.beginTargetUse(req)
+		defer done()
 		wait := time.Duration(req.WaitMillis) * time.Millisecond
 		if wait <= 0 {
 			wait = 500 * time.Millisecond
@@ -138,13 +171,8 @@ func (d *Daemon) Handle(req Request) Response {
 		}
 		return Response{Output: result.Output, ExitCode: result.ExitCode}
 	case "send":
-		tab := d.store.GetOrCreate(req.Session, req.Pane, req.Tab, func() Runner {
-			runner, err := NewPTYRunner(d.shell)
-			if err != nil {
-				return &errorRunner{err: err}
-			}
-			return runner
-		})
+		tab, done := d.beginTargetUse(req)
+		defer done()
 		if req.WaitMillis > 0 {
 			result, err := tab.Runner.SendWait(req.Command, time.Duration(req.WaitMillis)*time.Millisecond)
 			if err != nil {
@@ -157,13 +185,8 @@ func (d *Daemon) Handle(req Request) Response {
 		}
 		return Response{}
 	case "command":
-		tab := d.store.GetOrCreate(req.Session, req.Pane, req.Tab, func() Runner {
-			runner, err := NewPTYRunner(d.shell)
-			if err != nil {
-				return &errorRunner{err: err}
-			}
-			return runner
-		})
+		tab, done := d.beginTargetUse(req)
+		defer done()
 		if req.WaitMillis > 0 {
 			result, err := tab.Runner.CommandWait(req.Command, time.Duration(req.WaitMillis)*time.Millisecond)
 			if err != nil {
@@ -176,19 +199,17 @@ func (d *Daemon) Handle(req Request) Response {
 		}
 		return Response{}
 	case "read":
-		tab := d.store.GetOrCreate(req.Session, req.Pane, req.Tab, func() Runner {
-			runner, err := NewPTYRunner(d.shell)
-			if err != nil {
-				return &errorRunner{err: err}
-			}
-			return runner
-		})
+		tab, done := d.beginTargetUse(req)
+		defer done()
 		result, err := tab.Runner.Read(req.ReadCount)
 		if err != nil {
 			return Response{Error: err.Error()}
 		}
 		return Response{Output: result.Output, ExitCode: result.ExitCode}
 	case "list":
+		if req.Session != "" && req.Pane != "" && req.Tab != "" {
+			d.store.TouchTarget(req.Session, req.Pane, req.Tab)
+		}
 		return Response{Snapshot: d.store.SnapshotTarget(req.Session, req.Pane, req.Tab)}
 	case "kill":
 		var err error
@@ -213,6 +234,55 @@ func (d *Daemon) Handle(req Request) Response {
 	default:
 		return Response{Error: fmt.Sprintf("unknown action %q", req.Action)}
 	}
+}
+
+func (d *Daemon) startCleanupLoop() {
+	if !d.options.AutoRelease.Enabled {
+		return
+	}
+	interval := d.options.AutoRelease.SweepInterval
+	if interval <= 0 {
+		interval = time.Minute
+	}
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				d.cleanupIdle(time.Now())
+			case <-d.stopped:
+				return
+			}
+		}
+	}()
+}
+
+func (d *Daemon) cleanupIdle(now time.Time) {
+	options := d.options.AutoRelease
+	if !options.Enabled {
+		return
+	}
+	if err := d.store.CloseIdleTargets(now, options.TargetIdleTimeout); err != nil {
+		_, _ = fmt.Fprintln(os.Stderr, err)
+	}
+	if options.DaemonIdleTimeout <= 0 || !d.store.Empty() {
+		return
+	}
+
+	d.activityMu.Lock()
+	idleFor := now.Sub(d.lastActivity)
+	d.activityMu.Unlock()
+	if idleFor >= options.DaemonIdleTimeout {
+		d.requestStop()
+	}
+}
+
+func (d *Daemon) markActivity() {
+	d.activityMu.Lock()
+	d.lastActivity = time.Now()
+	d.activityMu.Unlock()
 }
 
 func (d *Daemon) Stopped() bool {

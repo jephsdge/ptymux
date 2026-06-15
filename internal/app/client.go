@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"syscall"
 	"time"
 
@@ -17,7 +16,11 @@ import (
 )
 
 func DefaultSocketPath() string {
-	return filepath.Join(os.TempDir(), "ptymux-"+strconv.Itoa(os.Getuid())+".sock")
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return filepath.Join(os.TempDir(), "ptymux-default.sock")
+	}
+	return filepath.Join(home, ".ptymux", "sockets", "ptymux-default.sock")
 }
 
 func Run(cfg Config) (server.Response, error) {
@@ -27,7 +30,13 @@ func Run(cfg Config) (server.Response, error) {
 	}
 
 	if cfg.Action == ActionDaemon {
-		return server.Response{}, server.NewDaemon("").Serve(socketPath)
+		userConfig, err := LoadUserConfig()
+		if err != nil {
+			return server.Response{}, err
+		}
+		return server.Response{}, server.NewDaemonWithOptions("", server.DaemonOptions{
+			AutoRelease: userConfig.AutoRelease,
+		}).Serve(socketPath)
 	}
 
 	req := server.Request{

@@ -290,8 +290,11 @@ ptymux kill work
 The default socket path is:
 
 ```text
-/tmp/ptymux-<uid>.sock
+~/.ptymux/sockets/ptymux-default.sock
 ```
+
+`ptymux` creates the `~/.ptymux/sockets` directory automatically when the daemon
+starts.
 
 Use a custom socket when you want a separate daemon:
 
@@ -299,6 +302,40 @@ Use a custom socket when you want a separate daemon:
 ptymux --socket /tmp/project-a.sock work "pwd"
 ptymux --socket /tmp/project-a.sock stop
 ```
+
+## Configuration
+
+`ptymux` reads optional user configuration from:
+
+```text
+~/.ptymux/config.json
+```
+
+Default configuration:
+
+```json
+{
+  "auto_release": {
+    "enabled": true,
+    "target_idle_timeout": "8h",
+    "daemon_idle_timeout": "30m"
+  }
+}
+```
+
+`target_idle_timeout` releases a target after it has not been used for the
+configured duration. Releasing a target closes its shell and loses that target's
+current directory, environment, and interactive state.
+
+`daemon_idle_timeout` stops an empty daemon after it has had no client requests
+for the configured duration. Stopping the daemon removes its socket. The next
+`ptymux` command starts a new daemon automatically.
+
+Set either timeout to `"0"` to disable that specific release behavior, or set
+`enabled` to `false` to disable automatic release entirely.
+
+Configuration is read when the daemon starts. Restart the daemon with
+`ptymux stop` for configuration changes to affect an already running daemon.
 
 ## Notes
 
