@@ -120,6 +120,28 @@ func TestParseMarkedOutputKeepsPromptAfterMarker(t *testing.T) {
 	}
 }
 
+func TestParseMarkedOutputCleansTerminalControls(t *testing.T) {
+	raw := []byte("pwd\r\n\x1b]0;user@host:/path\x07\x1b[01;32mhost app $\x1b[00m\x1b[Kpwd\r\n/home/work\r\n__PTYMUX_DONE_TEST__:0\r\n\x1b[01;32mhost app $\x1b[00m\x1b[K")
+	marker := []byte("__PTYMUX_DONE_TEST__:")
+	idx := bytes.Index(raw, marker)
+	if idx < 0 {
+		t.Fatal("marker not found in test input")
+	}
+
+	result := parseMarkedOutput(raw, idx, len(marker), "pwd", "host app $")
+
+	if strings.ContainsAny(result.Output, "\x1b\a") ||
+		strings.Contains(result.Output, "]0;") ||
+		strings.Contains(result.Output, "[01;32m") ||
+		strings.Contains(result.Output, "[K") {
+		t.Fatalf("Output leaked terminal controls: %q", result.Output)
+	}
+	if !strings.Contains(result.Output, "host app $pwd") ||
+		!strings.Contains(result.Output, "/home/work") {
+		t.Fatalf("Output = %q, want clean prompt and command output", result.Output)
+	}
+}
+
 func TestCurrentLineReadsTerminalScreenState(t *testing.T) {
 	runner := &PTYRunner{term: vt10x.New(vt10x.WithSize(40, 10))}
 	runner.observe([]byte("sh-5.3$ "))
@@ -443,5 +465,100 @@ func TestPTYRunnerMultipleFollowersReceiveOutput(t *testing.T) {
 	}
 	if err := <-secondErr; err != nil {
 		t.Fatalf("second Follow returned error: %v", err)
+	}
+}
+
+func TestWriteSubscriptionCleansSplitTerminalControls(t *testing.T) {
+	runner := &PTYRunner{}
+	ch := make(chan string, 3)
+	ch <- "\x1b]0;user@"
+	ch <- "host:/path\x07\x1b[01;32mhost $"
+	ch <- "\x1b[00m\x1b[K\n"
+	close(ch)
+
+	var out bytes.Buffer
+	if err := runner.writeSubscription(&out, ch, 0, nil); err != nil {
+		t.Fatalf("writeSubscription returned error: %v", err)
+	}
+
+	got := out.String()
+	want := "host $\n"
+	if got != want {
+		t.Fatalf("streamed output = %q, want %q", got, want)
+	}
+}
+
+func TestWriteSubscriptionAppliesCarriageReturnAcrossChunks(t *testing.T) {
+	runner := &PTYRunner{}
+	ch := make(chan string, 2)
+	ch <- "abc\r"
+	ch <- "xyz"
+	close(ch)
+
+	var out bytes.Buffer
+	if err := runner.writeSubscription(&out, ch, 0, nil); err != nil {
+		t.Fatalf("writeSubscription returned error: %v", err)
+	}
+
+	got := out.String()
+	want := "xyz"
+	if got != want {
+		t.Fatalf("streamed output = %q, want %q", got, want)
+	}
+}
+
+func TestWriteSubscriptionAppliesBackspaceAcrossChunks(t *testing.T) {
+	runner := &PTYRunner{}
+	ch := make(chan string, 2)
+	ch <- "abc\b"
+	ch <- " \b"
+	close(ch)
+
+	var out bytes.Buffer
+	if err := runner.writeSubscription(&out, ch, 0, nil); err != nil {
+		t.Fatalf("writeSubscription returned error: %v", err)
+	}
+
+	got := out.String()
+	want := "ab"
+	if got != want {
+		t.Fatalf("streamed output = %q, want %q", got, want)
+	}
+}
+
+func TestWriteSubscriptionFlushesPromptWithoutNewline(t *testing.T) {
+	runner := &PTYRunner{}
+	ch := make(chan string, 1)
+	done := make(chan struct{})
+
+	var out safeBuffer
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- runner.writeSubscription(&out, ch, 0, done)
+	}()
+	ch <- "Password: "
+	waitForOutput(t, &out, "Password: ")
+	close(done)
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("writeSubscription returned error: %v", err)
+	}
+}
+
+func TestSkipPrefixWriterSkipsSplitDuplicatePrefix(t *testing.T) {
+	var out bytes.Buffer
+	w := &skipPrefixWriter{w: &out, prefix: "^C"}
+
+	if _, err := w.Write([]byte("^")); err != nil {
+		t.Fatalf("Write returned error: %v", err)
+	}
+	if _, err := w.Write([]byte("C\nsh$ ")); err != nil {
+		t.Fatalf("Write returned error: %v", err)
+	}
+
+	got := out.String()
+	want := "\nsh$ "
+	if got != want {
+		t.Fatalf("output = %q, want %q", got, want)
 	}
 }

@@ -89,6 +89,8 @@ ptymux stop
   release; defaults are enabled with `target_idle_timeout` of `8h` and
   `daemon_idle_timeout` of `30m`.
 - Remember that PTY output combines stdout and stderr, like a normal terminal.
+- Expect clean text output by default: terminal color, title, cursor, and
+  line-control sequences are removed, while prompt text remains visible.
 - Treat `idle` and `send -t` as quiet-output heuristics; delayed output may arrive after the command returns.
 - Do not rely on `read -n` as full scrollback; it reads recent command regions from the virtual terminal screen.
 - Avoid putting secrets in command arguments, especially SSH passwords.

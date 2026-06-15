@@ -46,6 +46,36 @@ type subscriber struct {
 	reliable bool
 }
 
+type skipPrefixWriter struct {
+	w       io.Writer
+	prefix  string
+	pending string
+	done    bool
+}
+
+func (w *skipPrefixWriter) Write(p []byte) (int, error) {
+	if w.done || w.prefix == "" {
+		_, err := w.w.Write(p)
+		return len(p), err
+	}
+
+	w.pending += string(p)
+	if strings.HasPrefix(w.prefix, w.pending) {
+		if w.pending == w.prefix {
+			w.done = true
+			w.pending = ""
+		}
+		return len(p), nil
+	}
+	w.done = true
+	if strings.HasPrefix(w.pending, w.prefix) {
+		w.pending = strings.TrimPrefix(w.pending, w.prefix)
+	}
+	_, err := io.WriteString(w.w, w.pending)
+	w.pending = ""
+	return len(p), err
+}
+
 func NewPTYRunner(shell string) (*PTYRunner, error) {
 	if shell == "" {
 		shell = "/bin/sh"
@@ -171,7 +201,7 @@ func (r *PTYRunner) Read(count int) (RunResult, error) {
 	if r.term == nil {
 		return RunResult{}, nil
 	}
-	screen := strings.TrimRight(r.term.String(), "\n")
+	screen := CleanTerminalString(strings.TrimRight(r.term.String(), "\n"))
 	if count > 0 {
 		return RunResult{Output: recentTerminalEntries(screen, count), ExitCode: 0}, nil
 	}
@@ -218,6 +248,7 @@ func (r *PTYRunner) sendWait(input string, quietFor, maxWait time.Duration, retu
 	if err != nil {
 		return RunResult{}, err
 	}
+	output = cleanTerminalNoise(output)
 	output = formatCommandTranscript(trimOutputBoundary(output), input, prefix)
 	result := RunResult{Output: output, ExitCode: 0}
 	if timedOut {
@@ -250,6 +281,7 @@ func (r *PTYRunner) commandWait(keys string, quietFor, maxWait time.Duration) (R
 	if err != nil {
 		return RunResult{}, err
 	}
+	output = cleanTerminalNoise(output)
 	output = formatCommandTranscript(trimOutputBoundary(output), keys, prefix)
 	result := RunResult{Output: output, ExitCode: 0}
 	if timedOut {
@@ -320,11 +352,19 @@ func (r *PTYRunner) ctrlCFollow(output io.Writer, quietFor time.Duration, done <
 		r.commandMu.Unlock()
 		return err
 	}
+	if _, err := io.WriteString(output, "^C"); err != nil {
+		r.unsubscribe(sub.id)
+		r.commandMu.Unlock()
+		return nil
+	}
 	r.commandMu.Unlock()
 	defer r.unsubscribe(sub.id)
 
 	var observed bytes.Buffer
-	err := r.writeSubscription(io.MultiWriter(output, &observed), sub.ch, quietFor, done)
+	err := r.writeSubscription(&skipPrefixWriter{
+		w:      io.MultiWriter(output, &observed),
+		prefix: "^C",
+	}, sub.ch, quietFor, done)
 	if observed.Len() > 0 {
 		r.record(strings.TrimRight(observed.String(), "\n"))
 	}
@@ -484,20 +524,61 @@ func (r *PTYRunner) writeSubscription(output io.Writer, ch <-chan string, quietF
 		defer timer.Stop()
 		quiet = timer.C
 	}
+	cleaner := NewTerminalCleaner()
+	flushTimer := time.NewTimer(time.Hour)
+	if !flushTimer.Stop() {
+		<-flushTimer.C
+	}
+	defer flushTimer.Stop()
+	var flush <-chan time.Time
+	const streamFlushInterval = 100 * time.Millisecond
+	flushNow := func() {
+		if flushed := cleaner.Flush(); flushed != "" {
+			_, _ = io.WriteString(output, flushed)
+		}
+	}
+	scheduleFlush := func() {
+		if !cleaner.Pending() {
+			flush = nil
+			if !flushTimer.Stop() {
+				select {
+				case <-flushTimer.C:
+				default:
+				}
+			}
+			return
+		}
+		if !flushTimer.Stop() {
+			select {
+			case <-flushTimer.C:
+			default:
+			}
+		}
+		flushTimer.Reset(streamFlushInterval)
+		flush = flushTimer.C
+	}
 
 	for {
 		select {
 		case <-doneCh:
+			flushNow()
 			return nil
 		case <-quiet:
+			flushNow()
 			return nil
+		case <-flush:
+			flushNow()
+			flush = nil
 		case chunk, ok := <-ch:
 			if !ok {
+				flushNow()
 				return r.subscriptionErr()
 			}
-			if _, err := io.WriteString(output, chunk); err != nil {
+			cleaned := cleaner.WriteString(chunk)
+			if _, err := io.WriteString(output, cleaned); err != nil {
 				return nil
 			}
+			scheduleFlush()
 			if timer != nil {
 				if !timer.Stop() {
 					select {
@@ -764,7 +845,7 @@ func (r *PTYRunner) observe(data []byte) string {
 	if r.term != nil {
 		_, _ = r.term.Write(data)
 	}
-	return cleanTerminalNoise(string(data))
+	return string(data)
 }
 
 func (r *PTYRunner) currentLine() string {
@@ -854,8 +935,5 @@ func isPromptLike(line string) bool {
 }
 
 func cleanTerminalNoise(output string) string {
-	output = strings.ReplaceAll(output, "\x1b[?2004h", "")
-	output = strings.ReplaceAll(output, "\x1b[?2004l", "")
-	output = strings.ReplaceAll(output, "\r", "")
-	return output
+	return CleanTerminalString(output)
 }

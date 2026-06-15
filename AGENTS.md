@@ -55,6 +55,11 @@ prefer the word `target`.
   Core PTY runner. Each runner owns one shell process, one PTY, one background
   reader goroutine, a virtual terminal, and live output subscribers.
 
+- `internal/server/cleaner.go`
+  Terminal output cleaner. It removes terminal control sequences and applies
+  basic line semantics so command and stream output is stable clean text for
+  agents.
+
 - `internal/server/keys.go`
   Parser for terminal key sequences used by `command`.
 
@@ -71,6 +76,10 @@ code path that reads from the PTY fd. The reader:
 - keeps terminal screen state current.
 
 Command methods must not read the PTY directly.
+
+PTY bytes should stay raw until they reach the command result or stream writer.
+Use `CleanTerminalString` for complete command/read output and
+`TerminalCleaner` for streaming output so split OSC/CSI sequences do not leak.
 
 Each target shell is started through `creack/pty`, which creates a new session
 and process group for the shell. Target shutdown must signal the shell process

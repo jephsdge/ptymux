@@ -429,6 +429,9 @@ Options:
 Default socket:
   ~/.ptymux/sockets/ptymux-default.sock
 
+Output:
+  clean text by default; terminal color/title/cursor controls are removed
+
 Config:
   ~/.ptymux/config.json
   shell defaults to /bin/sh

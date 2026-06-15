@@ -200,6 +200,12 @@ Stop the default daemon and close all managed shells:
 ptymux stop
 ```
 
+## Clean Text Output
+
+`ptymux` returns clean text by default. Terminal color, title, cursor, and
+line-control sequences are removed from command output and streams. Plain prompt
+text remains visible so agents can still infer the current shell context.
+
 ## Auto Release
 
 `ptymux` reads optional user configuration from:

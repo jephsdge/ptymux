@@ -351,6 +351,8 @@ Configuration is read when the daemon starts. Restart the daemon with
 
 - Each full target path resolves to a long-lived shell process attached to a PTY.
 - PTY output is combined stdout/stderr, like a normal terminal.
+- Output returned to clients is clean text by default. Terminal color, title,
+  cursor, and line-control sequences are removed while prompt text is preserved.
 - `send -f`, `follow`, and `ctrl-c` stream output until the client disconnects.
 - There is no full interactive attach mode yet; input is still sent one command
   at a time.
