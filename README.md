@@ -44,8 +44,19 @@ You can override the target:
 
 ```sh
 GOOS=linux GOARCH=arm64 ./scripts/build.sh
+GOOS=darwin GOARCH=arm64 ./scripts/build.sh
 OUT_DIR=. BIN_NAME=ptymux CGO_ENABLED=0 ./scripts/build.sh
 ```
+
+To build the platform binaries used by the bundled skill wrapper:
+
+```sh
+TARGET=skill-all ./scripts/build.sh
+```
+
+That command writes ignored platform binaries to `skills/use-ptymux/assets/`.
+The committed `skills/use-ptymux/assets/ptymux` wrapper selects the matching
+Linux or macOS binary at runtime.
 
 Manual equivalent:
 

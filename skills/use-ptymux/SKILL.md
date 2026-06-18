@@ -20,8 +20,18 @@ on the host. Resolve it relative to the skill directory, then run commands like:
 /path/to/use-ptymux/assets/ptymux work "pwd"
 ```
 
-If that executable is unavailable or incompatible, use a user-provided `ptymux`
-on `PATH`.
+The `assets/ptymux` wrapper automatically selects the matching Linux or macOS
+platform binary. Do not choose a platform-specific `ptymux-linux-*` or
+`ptymux-darwin-*` file manually.
+
+If the wrapper reports a missing platform binary, run this in the ptymux repo:
+
+```sh
+TARGET=skill-all ./scripts/build.sh
+```
+
+If the skill-local executable is unavailable for another reason, use a
+user-provided `ptymux` on `PATH`.
 
 ## Workflow
 

@@ -13,8 +13,18 @@ skill directory:
 /path/to/use-ptymux/assets/ptymux work "pwd"
 ```
 
-Use a system `ptymux` only when the skill-local executable is unavailable or
-incompatible with the host platform.
+The `assets/ptymux` wrapper automatically selects the matching Linux or macOS
+platform binary. Do not choose a platform-specific `ptymux-linux-*` or
+`ptymux-darwin-*` file manually.
+
+If the wrapper reports a missing platform binary, run this in the ptymux repo:
+
+```sh
+TARGET=skill-all ./scripts/build.sh
+```
+
+Use a system `ptymux` only when the skill-local executable is unavailable for
+another reason.
 
 ## Target Paths
 

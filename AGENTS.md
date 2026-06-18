@@ -66,6 +66,11 @@ prefer the word `target`.
 - `internal/server/protocol.go`
   JSON request/response types shared by app and server.
 
+- `skills/use-ptymux/assets/ptymux`
+  Skill-local wrapper committed with the usage skill. It selects the matching
+  generated Linux or macOS platform binary at runtime; agents should invoke this
+  wrapper rather than a platform-specific binary.
+
 ## PTY Output Model
 
 Each `PTYRunner` has exactly one background reader goroutine. It is the only
@@ -228,6 +233,16 @@ Expected `ldd` result:
 not a dynamic executable
 ```
 
+Build the skill wrapper platform binaries with:
+
+```sh
+TARGET=skill-all ./scripts/build.sh
+```
+
+This generates Linux/macOS amd64/arm64 binaries in
+`skills/use-ptymux/assets/`. The generated `ptymux-*` files are ignored and
+must not be committed.
+
 ## Manual Smoke Tests
 
 Use a temporary socket so tests do not disturb a user's default daemon:
@@ -280,6 +295,7 @@ Ignored build outputs include:
 - `/ptymux`
 - `/bin/`
 - `/dist/`
+- `skills/use-ptymux/assets/ptymux-*`
 - Go test binaries and coverage files
 
 Do not commit generated binaries.

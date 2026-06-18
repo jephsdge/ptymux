@@ -1,0 +1,48 @@
+#!/usr/bin/env sh
+set -eu
+
+dir=$(CDPATH= cd "$(dirname "$0")" && pwd)
+
+os=$(uname -s)
+case "$os" in
+  Linux)
+    goos=linux
+    ;;
+  Darwin)
+    goos=darwin
+    ;;
+  *)
+    echo "ptymux: unsupported OS: $os" >&2
+    exit 1
+    ;;
+esac
+
+arch=$(uname -m)
+case "$arch" in
+  x86_64|amd64)
+    goarch=amd64
+    ;;
+  arm64|aarch64)
+    goarch=arm64
+    ;;
+  *)
+    echo "ptymux: unsupported architecture: $arch" >&2
+    exit 1
+    ;;
+esac
+
+binary=$dir/ptymux-$goos-$goarch
+
+if [ ! -e "$binary" ]; then
+  echo "ptymux: missing platform binary: $binary" >&2
+  echo "ptymux: run TARGET=skill GOOS=$goos GOARCH=$goarch ./scripts/build.sh or TARGET=skill-all ./scripts/build.sh" >&2
+  exit 1
+fi
+
+if [ ! -x "$binary" ]; then
+  echo "ptymux: platform binary is not executable: $binary" >&2
+  echo "ptymux: run chmod +x \"$binary\" or rebuild it" >&2
+  exit 1
+fi
+
+exec "$binary" "$@"
