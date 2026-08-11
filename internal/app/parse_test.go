@@ -1,6 +1,7 @@
 package app
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -607,6 +608,17 @@ func TestParseReadTargetPath(t *testing.T) {
 	}
 }
 
+func TestParseRejectsNegativeReadCount(t *testing.T) {
+	for _, args := range [][]string{
+		{"read", "-n", "-1", "work"},
+		{"client", "relay", "read", "-n", "-1", "work"},
+	} {
+		if _, err := Parse(args); err == nil || !strings.Contains(err.Error(), "must not be negative") {
+			t.Fatalf("Parse(%q) error = %v, want negative count error", args, err)
+		}
+	}
+}
+
 func TestParseFollowTargetPath(t *testing.T) {
 	cfg, err := Parse([]string{"follow", "work/main"})
 	if err != nil {
@@ -649,5 +661,236 @@ func TestParseListTargetPathAfterFlags(t *testing.T) {
 	}
 	if cfg.Session != "work" || cfg.Pane != "main" || cfg.Tab != "" {
 		t.Fatalf("target = %q/%q/%q, want work/main/empty", cfg.Session, cfg.Pane, cfg.Tab)
+	}
+}
+
+func TestParseExplicitLocalMatchesImplicitLocal(t *testing.T) {
+	implicit, err := Parse([]string{"send", "work", "pwd"})
+	if err != nil {
+		t.Fatalf("implicit Parse returned error: %v", err)
+	}
+	explicit, err := Parse([]string{"local", "send", "work", "pwd"})
+	if err != nil {
+		t.Fatalf("explicit Parse returned error: %v", err)
+	}
+	if implicit != explicit {
+		t.Fatalf("implicit = %+v, explicit = %+v", implicit, explicit)
+	}
+	if explicit.Mode != ModeLocal {
+		t.Fatalf("Mode = %q, want local", explicit.Mode)
+	}
+}
+
+func TestParseServerDefaults(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	cfg, err := Parse([]string{"server"})
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+	serverDir := filepath.Join(home, ".ptymux", "server")
+	if cfg.TokenFile != filepath.Join(serverDir, "token") {
+		t.Fatalf("TokenFile = %q", cfg.TokenFile)
+	}
+	if cfg.ClientRegistry != filepath.Join(serverDir, "clients.json") {
+		t.Fatalf("ClientRegistry = %q", cfg.ClientRegistry)
+	}
+}
+
+func TestParseServerMode(t *testing.T) {
+	cfg, err := Parse([]string{
+		"server",
+		"--listen", "127.0.0.1:9443",
+		"--token-file", "server.token",
+		"--client-registry", "clients.json",
+		"--shell", "/bin/sh",
+		"--max-connections", "100",
+		"--max-connections-per-client", "8",
+		"--max-targets-per-client", "20",
+		"--auth-rate", "2.5",
+		"--auth-burst", "10",
+	})
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+	if cfg.Mode != ModeServer || cfg.Listen != "127.0.0.1:9443" || cfg.ClientRegistry != "clients.json" {
+		t.Fatalf("server config = %+v", cfg)
+	}
+	if cfg.MaxConnections != 100 || cfg.MaxConnectionsPerClient != 8 || cfg.MaxTargetsPerClient != 20 {
+		t.Fatalf("server limits = %+v", cfg)
+	}
+	if cfg.AuthRate != 2.5 || cfg.AuthBurst != 10 {
+		t.Fatalf("server authentication limits = %+v", cfg)
+	}
+}
+
+func TestParseServerRejectsRemovedTLSFlags(t *testing.T) {
+	for _, flagName := range []string{"--tls-cert", "--tls-key"} {
+		if _, err := Parse([]string{"server", flagName, "unused"}); err == nil {
+			t.Fatalf("Parse accepted removed flag %s", flagName)
+		}
+	}
+}
+
+func TestParseClientRegisterFlagsAfterOperation(t *testing.T) {
+	cfg, err := Parse([]string{
+		"client", "register",
+		"--name", "alice",
+		"--url", "http://mux.example.com:8443",
+		"--token", "shared-token",
+	})
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+	if cfg.Mode != ModeClient || cfg.Action != ActionRegister {
+		t.Fatalf("mode/action = %q/%q", cfg.Mode, cfg.Action)
+	}
+	if cfg.ClientName != "alice" || cfg.URL != "http://mux.example.com:8443" || cfg.Token != "shared-token" {
+		t.Fatalf("client config = %+v", cfg)
+	}
+}
+
+func TestParseClientExplicitCredentialsBeforeOperation(t *testing.T) {
+	cfg, err := Parse([]string{
+		"client",
+		"--url", "http://mux.example.com:8443",
+		"--token-file", "token",
+		"--name", "alice",
+		"--password-file", "password",
+		"send", "work", "echo ok",
+	})
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+	if cfg.Action != ActionSend || cfg.Session != "work" || cfg.Command != "echo ok" {
+		t.Fatalf("client config = %+v", cfg)
+	}
+}
+
+func TestParseClientPayloadPreservesConnectionOptionNames(t *testing.T) {
+	cfg, err := Parse([]string{"client", "relay", "text", "work", "--password", "literal"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Action != ActionText || cfg.Command != "--password literal" || cfg.Password != "" {
+		t.Fatalf("client config = %+v", cfg)
+	}
+
+	cfg, err = Parse([]string{"client", "send", "--url", "http://relay.example", "work", "--token=value"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Action != ActionSend || cfg.Command != "--token=value" || cfg.Token != "" || cfg.URL != "http://relay.example" {
+		t.Fatalf("client config = %+v", cfg)
+	}
+}
+
+func TestParseClientAliasRead(t *testing.T) {
+	cfg, err := Parse([]string{"client", "relay", "read", "-n", "3", "work/main"})
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+	if cfg.Alias != "relay" || cfg.Action != ActionRead || cfg.ReadCount != 3 {
+		t.Fatalf("client config = %+v", cfg)
+	}
+	if cfg.Session != "work" || cfg.Pane != "main" || cfg.Tab != "default" {
+		t.Fatalf("target = %q/%q/%q", cfg.Session, cfg.Pane, cfg.Tab)
+	}
+}
+
+func TestParseClientRejectsInlineAndFileSecrets(t *testing.T) {
+	_, err := Parse([]string{"client", "--token", "a", "--token-file", "b", "list"})
+	if err == nil {
+		t.Fatal("Parse returned nil error")
+	}
+}
+
+func TestParseRejectsOversizedDirectTargetFlag(t *testing.T) {
+	longName := strings.Repeat("a", 65)
+	if _, err := Parse([]string{"-s", longName, "pwd"}); err == nil {
+		t.Fatal("Parse accepted oversized -s target")
+	}
+}
+
+func TestParseRejectsOversizedReadCount(t *testing.T) {
+	if _, err := Parse([]string{"read", "-n", "4097", "work"}); err == nil {
+		t.Fatal("Parse accepted read count above transcript limit")
+	}
+	if _, err := Parse([]string{"client", "relay", "read", "-n", "4097", "work"}); err == nil {
+		t.Fatal("Parse accepted remote read count above transcript limit")
+	}
+}
+
+func TestParseServerPreAuthConnectionLimit(t *testing.T) {
+	cfg, err := Parse([]string{"server", "--max-pre-auth-connections", "17"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxPreAuthConnections != 17 {
+		t.Fatalf("MaxPreAuthConnections = %d, want 17", cfg.MaxPreAuthConnections)
+	}
+	if _, err := Parse([]string{"server", "--max-pre-auth-connections", "-1"}); err == nil {
+		t.Fatal("Parse accepted negative pre-auth connection limit")
+	}
+}
+
+func TestRoleSpecificParsersUseDirectSyntax(t *testing.T) {
+	client, err := ParseClient([]string{"relay", "create", "work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.Mode != ModeClient || client.Alias != "relay" || client.Action != ActionCreate || client.Session != "work" {
+		t.Fatalf("client config = %+v", client)
+	}
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	serverCfg, err := ParseServer([]string{"--listen", "127.0.0.1:9443"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if serverCfg.Mode != ModeServer || serverCfg.Listen != "127.0.0.1:9443" {
+		t.Fatalf("server config = %+v", serverCfg)
+	}
+
+	local, err := ParseLocal([]string{"local", "send", "work", "pwd"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if local.Mode != ModeLocal || local.Action != ActionSend || local.Session != "work" {
+		t.Fatalf("local config = %+v", local)
+	}
+}
+
+func TestParseClientHelpAfterOptionsOrAlias(t *testing.T) {
+	for _, args := range [][]string{
+		{"--url", "http://mux.example.com:8443", "--help"},
+		{"relay", "--help"},
+	} {
+		cfg, err := ParseClient(args)
+		if err != nil {
+			t.Fatalf("ParseClient(%q) returned error: %v", args, err)
+		}
+		if cfg.Action != ActionHelp {
+			t.Fatalf("ParseClient(%q) action = %q, want help", args, cfg.Action)
+		}
+	}
+}
+
+func TestRoleSpecificHelpTextIsIsolated(t *testing.T) {
+	local := LocalHelpText()
+	if !strings.Contains(local, "ptymux [--socket PATH]") || strings.Contains(local, "ptymux-client") || strings.Contains(local, "ptymux-server") {
+		t.Fatalf("unexpected local help:\n%s", local)
+	}
+
+	client := ClientHelpText()
+	if !strings.Contains(client, "ptymux-client register") || strings.Contains(client, "ptymux [--socket PATH]") || strings.Contains(client, "ptymux-server") {
+		t.Fatalf("unexpected client help:\n%s", client)
+	}
+
+	serverHelp := ServerHelpText()
+	if !strings.Contains(serverHelp, "ptymux-server [--listen ADDRESS]") || strings.Contains(serverHelp, "ptymux-client") || strings.Contains(serverHelp, "ptymux [--socket PATH]") {
+		t.Fatalf("unexpected server help:\n%s", serverHelp)
 	}
 }

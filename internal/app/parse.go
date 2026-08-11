@@ -6,28 +6,44 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"ptymux/internal/server"
 )
+
+type Mode string
 
 type Action string
 
 const (
-	ActionRun     Action = "run"
-	ActionHelp    Action = "help"
-	ActionDaemon  Action = "daemon"
-	ActionList    Action = "list"
-	ActionKill    Action = "kill"
-	ActionStop    Action = "stop"
-	ActionIdle    Action = "idle"
-	ActionSend    Action = "send"
-	ActionText    Action = "text"
-	ActionCommand Action = "command"
-	ActionKeys    Action = "keys"
-	ActionCtrlC   Action = "ctrl-c"
-	ActionRead    Action = "read"
-	ActionFollow  Action = "follow"
+	ModeLocal  Mode = "local"
+	ModeServer Mode = "server"
+	ModeClient Mode = "client"
+)
+
+const (
+	ActionRun      Action = "run"
+	ActionHelp     Action = "help"
+	ActionDaemon   Action = "daemon"
+	ActionList     Action = "list"
+	ActionKill     Action = "kill"
+	ActionStop     Action = "stop"
+	ActionIdle     Action = "idle"
+	ActionSend     Action = "send"
+	ActionText     Action = "text"
+	ActionCommand  Action = "command"
+	ActionKeys     Action = "keys"
+	ActionCtrlC    Action = "ctrl-c"
+	ActionRead     Action = "read"
+	ActionFollow   Action = "follow"
+	ActionCreate   Action = "create"
+	ActionClose    Action = "close"
+	ActionRegister Action = "register"
+	ActionRotate   Action = "rotate"
+	ActionRevoke   Action = "revoke"
 )
 
 type Config struct {
+	Mode      Mode
 	Action    Action
 	Session   string
 	Pane      string
@@ -37,9 +53,71 @@ type Config struct {
 	Follow    bool
 	Wait      time.Duration
 	ReadCount int
+
+	Alias        string
+	URL          string
+	Token        string
+	TokenFile    string
+	ClientName   string
+	Password     string
+	PasswordFile string
+
+	Listen                  string
+	ClientRegistry          string
+	Shell                   string
+	ShutdownTimeout         time.Duration
+	MaxPreAuthConnections   int
+	MaxConnections          int
+	MaxConnectionsPerClient int
+	MaxTargetsPerClient     int
+	AuthRate                float64
+	AuthBurst               int
 }
 
 func Parse(args []string) (Config, error) {
+	if len(args) > 0 {
+		switch args[0] {
+		case "local":
+			return ParseLocal(args[1:])
+		case "server":
+			return ParseServer(args[1:])
+		case "client":
+			return ParseClient(args[1:])
+		}
+	}
+	return ParseLocal(args)
+}
+
+func ParseLocal(args []string) (Config, error) {
+	if len(args) > 0 && args[0] == "local" {
+		args = args[1:]
+	}
+	cfg, err := parseLocal(args)
+	cfg.Mode = ModeLocal
+	return validateParsedConfig(cfg, err)
+}
+
+func ParseClient(args []string) (Config, error) {
+	cfg, err := parseRemoteClient(args)
+	return validateParsedConfig(cfg, err)
+}
+
+func ParseServer(args []string) (Config, error) {
+	cfg, err := parseServer(args)
+	return validateParsedConfig(cfg, err)
+}
+
+func validateParsedConfig(cfg Config, err error) (Config, error) {
+	if err != nil || cfg.Action == ActionHelp {
+		return cfg, err
+	}
+	if err := validateConfig(cfg); err != nil {
+		return Config{}, err
+	}
+	return cfg, nil
+}
+
+func parseLocal(args []string) (Config, error) {
 	cfg := Config{
 		Action:  ActionRun,
 		Session: "default",
@@ -267,6 +345,247 @@ func Parse(args []string) (Config, error) {
 	return cfg, nil
 }
 
+func parseServer(args []string) (Config, error) {
+	cfg := Config{
+		Mode:                    ModeServer,
+		Listen:                  "0.0.0.0:8443",
+		Shell:                   "/bin/bash",
+		ShutdownTimeout:         10 * time.Second,
+		MaxPreAuthConnections:   256,
+		MaxConnections:          256,
+		MaxConnectionsPerClient: 16,
+		MaxTargetsPerClient:     64,
+		AuthRate:                5,
+		AuthBurst:               20,
+	}
+	if hasHelpArg(args) {
+		cfg.Action = ActionHelp
+		return cfg, nil
+	}
+	fs := flag.NewFlagSet("server", flag.ContinueOnError)
+	fs.StringVar(&cfg.Listen, "listen", cfg.Listen, "HTTP listen address")
+	fs.StringVar(&cfg.TokenFile, "token-file", "", "global server token file")
+	fs.StringVar(&cfg.ClientRegistry, "client-registry", "", "persistent client registry path")
+	fs.StringVar(&cfg.Shell, "shell", cfg.Shell, "target shell")
+	fs.DurationVar(&cfg.ShutdownTimeout, "shutdown-timeout", cfg.ShutdownTimeout, "graceful shutdown timeout")
+	fs.IntVar(&cfg.MaxPreAuthConnections, "max-pre-auth-connections", cfg.MaxPreAuthConnections, "maximum accepted TCP connections awaiting authentication")
+	fs.IntVar(&cfg.MaxConnections, "max-connections", cfg.MaxConnections, "maximum pending and active authenticated WebSocket connections")
+	fs.IntVar(&cfg.MaxConnectionsPerClient, "max-connections-per-client", cfg.MaxConnectionsPerClient, "maximum pending and active authenticated WebSocket connections per client")
+	fs.IntVar(&cfg.MaxTargetsPerClient, "max-targets-per-client", cfg.MaxTargetsPerClient, "maximum targets per client")
+	fs.Float64Var(&cfg.AuthRate, "auth-rate", cfg.AuthRate, "authentication and registration tokens added per second")
+	fs.IntVar(&cfg.AuthBurst, "auth-burst", cfg.AuthBurst, "authentication and registration burst size")
+	if err := fs.Parse(args); err != nil {
+		return Config{}, err
+	}
+	if len(fs.Args()) != 0 {
+		return Config{}, errors.New("server does not accept positional arguments")
+	}
+	if err := applyServerPathDefaults(&cfg); err != nil {
+		return Config{}, err
+	}
+	return cfg, nil
+}
+
+func applyServerPathDefaults(cfg *Config) error {
+	if cfg.TokenFile != "" && cfg.ClientRegistry != "" {
+		return nil
+	}
+	paths, err := defaultServerPaths()
+	if err != nil {
+		return err
+	}
+	if cfg.TokenFile == "" {
+		cfg.TokenFile = paths.TokenFile
+	}
+	if cfg.ClientRegistry == "" {
+		cfg.ClientRegistry = paths.ClientRegistry
+	}
+	return nil
+}
+
+func parseRemoteClient(args []string) (Config, error) {
+	cfg := Config{
+		Mode:    ModeClient,
+		Session: "default",
+		Pane:    "default",
+		Tab:     "default",
+	}
+	if len(args) == 0 || hasHelpArg(args) || args[0] == "help" {
+		cfg.Action = ActionHelp
+		return cfg, nil
+	}
+
+	remaining, err := extractRemoteOptions(&cfg, args)
+	if err != nil {
+		return Config{}, err
+	}
+	if len(remaining) == 0 {
+		return Config{}, errors.New("client requires an operation")
+	}
+
+	operationIndex := 0
+	if !isRemoteOperation(remaining[0]) {
+		cfg.Alias = remaining[0]
+		operationIndex = 1
+	}
+	if operationIndex >= len(remaining) {
+		return Config{}, errors.New("client alias requires an operation")
+	}
+	operation := remaining[operationIndex]
+	operationArgs := remaining[operationIndex+1:]
+	if !isRemoteOperation(operation) {
+		return Config{}, fmt.Errorf("unknown client operation %q", operation)
+	}
+	if hasHelpArg(operationArgs) {
+		cfg.Action = ActionHelp
+		return cfg, nil
+	}
+
+	switch operation {
+	case "register":
+		cfg.Action = ActionRegister
+		if len(operationArgs) != 0 {
+			return Config{}, errors.New("register does not accept positional arguments")
+		}
+		return cfg, nil
+	case "rotate":
+		cfg.Action = ActionRotate
+		if len(operationArgs) != 0 {
+			return Config{}, errors.New("rotate does not accept positional arguments")
+		}
+		return cfg, nil
+	case "revoke":
+		cfg.Action = ActionRevoke
+		if len(operationArgs) != 0 {
+			return Config{}, errors.New("revoke does not accept positional arguments")
+		}
+		return cfg, nil
+	case "create":
+		cfg.Action = ActionCreate
+		return applyTargetOnly(&cfg, operationArgs, operation)
+	case "close":
+		cfg.Action = ActionClose
+		return applyTargetOnly(&cfg, operationArgs, operation)
+	case "list":
+		cfg.Action = ActionList
+		if len(operationArgs) > 1 {
+			return Config{}, errors.New("list accepts at most one target")
+		}
+		if len(operationArgs) == 0 {
+			cfg.Session, cfg.Pane, cfg.Tab = "", "", ""
+			return cfg, nil
+		}
+		if err := applyTarget(&cfg, operationArgs[0], true); err != nil {
+			return Config{}, err
+		}
+		return cfg, nil
+	case "send":
+		cfg.Action = ActionSend
+		return applyCommandTarget(&cfg, operationArgs, operation)
+	case "text":
+		cfg.Action = ActionText
+		return applyCommandTarget(&cfg, operationArgs, operation)
+	case "keys":
+		cfg.Action = ActionKeys
+		return applyCommandTarget(&cfg, operationArgs, operation)
+	case "read":
+		cfg.Action = ActionRead
+		fs := flag.NewFlagSet("client read", flag.ContinueOnError)
+		fs.IntVar(&cfg.ReadCount, "n", 0, "number of recent terminal history lines")
+		if err := fs.Parse(operationArgs); err != nil {
+			return Config{}, err
+		}
+		if cfg.ReadCount < 0 {
+			return Config{}, errors.New("read count must not be negative")
+		}
+		return applyTargetOnly(&cfg, fs.Args(), operation)
+	case "follow":
+		cfg.Action = ActionFollow
+		cfg.Follow = true
+		return applyTargetOnly(&cfg, operationArgs, operation)
+	default:
+		return Config{}, fmt.Errorf("unknown client operation %q", operation)
+	}
+}
+
+func isRemoteOperation(value string) bool {
+	switch value {
+	case "register", "rotate", "revoke", "create", "list", "send", "text", "keys", "read", "follow", "close":
+		return true
+	default:
+		return false
+	}
+}
+
+func extractRemoteOptions(cfg *Config, args []string) ([]string, error) {
+	remaining := make([]string, 0, len(args))
+	operation := ""
+	targetConsumed := false
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			remaining = append(remaining, args[i+1:]...)
+			break
+		}
+		if operation != "" && remoteOperationHasPayload(operation) && targetConsumed {
+			remaining = append(remaining, arg)
+			continue
+		}
+
+		name, value, hasValue := strings.Cut(arg, "=")
+		var target *string
+		switch name {
+		case "--url":
+			target = &cfg.URL
+		case "--token":
+			target = &cfg.Token
+		case "--token-file":
+			target = &cfg.TokenFile
+		case "--name":
+			target = &cfg.ClientName
+		case "--password":
+			target = &cfg.Password
+		case "--password-file":
+			target = &cfg.PasswordFile
+		default:
+			remaining = append(remaining, arg)
+			if operation == "" && isRemoteOperation(arg) {
+				operation = arg
+			} else if operation != "" && remoteOperationHasPayload(operation) {
+				targetConsumed = true
+			}
+			continue
+		}
+		if !hasValue {
+			i++
+			if i >= len(args) {
+				return nil, fmt.Errorf("%s requires a value", name)
+			}
+			value = args[i]
+		}
+		if value == "" {
+			return nil, fmt.Errorf("%s requires a non-empty value", name)
+		}
+		*target = value
+	}
+	if cfg.Token != "" && cfg.TokenFile != "" {
+		return nil, errors.New("--token and --token-file cannot be used together")
+	}
+	if cfg.Password != "" && cfg.PasswordFile != "" {
+		return nil, errors.New("--password and --password-file cannot be used together")
+	}
+	return remaining, nil
+}
+
+func remoteOperationHasPayload(operation string) bool {
+	switch operation {
+	case "send", "text", "keys":
+		return true
+	default:
+		return false
+	}
+}
+
 func parseSend(cfg Config, args []string) (Config, error) {
 	if hasHelpArg(args) {
 		cfg.Action = ActionHelp
@@ -411,9 +730,12 @@ func parseRead(cfg Config, args []string) (Config, error) {
 		return cfg, nil
 	}
 	fs := flag.NewFlagSet("read", flag.ContinueOnError)
-	fs.IntVar(&cfg.ReadCount, "n", 0, "number of recent command transcript entries to read")
+	fs.IntVar(&cfg.ReadCount, "n", 0, "number of recent terminal history lines")
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
+	}
+	if cfg.ReadCount < 0 {
+		return Config{}, errors.New("read count must not be negative")
 	}
 	return applyTargetOnly(&cfg, fs.Args(), "read")
 }
@@ -457,61 +779,133 @@ func hasHelpArg(args []string) bool {
 	return false
 }
 
-func HelpText() string {
+func validateConfig(cfg Config) error {
+	if cfg.Mode == ModeServer {
+		if cfg.MaxPreAuthConnections < 0 {
+			return errors.New("maximum pre-auth connections must not be negative")
+		}
+		if cfg.MaxConnections < 0 || cfg.MaxConnectionsPerClient < 0 || cfg.MaxTargetsPerClient < 0 {
+			return errors.New("server limits must not be negative")
+		}
+		return nil
+	}
+	switch cfg.Action {
+	case ActionRegister, ActionRotate, ActionRevoke, ActionDaemon, ActionStop, ActionHelp:
+		return nil
+	case ActionRun, ActionList, ActionKill, ActionIdle, ActionSend, ActionText, ActionCommand, ActionKeys, ActionCtrlC, ActionRead, ActionFollow, ActionCreate, ActionClose:
+		return server.ValidateRequest(serverRequestFromConfig(cfg))
+	default:
+		return nil
+	}
+}
+
+func LocalHelpText() string {
 	return strings.TrimLeft(`
-ptymux - persistent command-line PTY targets
+ptymux - persistent local command-line PTY targets
 
 Usage:
   ptymux [--socket PATH] <target> <command>
-  ptymux [--socket PATH] idle [-t DURATION] <target> <input>
-  ptymux [--socket PATH] send [-f | -t DURATION] <target> <input>
-  ptymux [--socket PATH] text <target> <text>
-  ptymux [--socket PATH] command [-f | -t DURATION] <target> <keys>
-  ptymux [--socket PATH] keys [-f | -t DURATION] <target> <keys>
-  ptymux [--socket PATH] read [-n N] <target>
-  ptymux [--socket PATH] follow <target>
-  ptymux [--socket PATH] list [target]
-  ptymux [--socket PATH] kill [target]
-  ptymux [--socket PATH] stop
-  ptymux -h | --help | help
+  ptymux local [--socket PATH] <target> <command>
+  ptymux [local] idle [-t DURATION] <target> <input>
+  ptymux [local] send [-f | -t DURATION] <target> <input>
+  ptymux [local] text <target> <text>
+  ptymux [local] command [-f | -t DURATION] <target> <keys>
+  ptymux [local] keys [-f | -t DURATION] <target> <keys>
+  ptymux [local] ctrl-c <target>
+  ptymux [local] read [-n N] <target>
+  ptymux [local] follow <target>
+  ptymux [local] list [target]
+  ptymux [local] kill [target]
+  ptymux [local] stop
 
 Targets:
   work             -> work/default/default
   work/main        -> work/main/default
   work/main/build  -> work/main/build
+  Each component: valid UTF-8, at most 64 bytes, no slash/control characters
+  Command/input text: at most 128 KiB; read -n N: 0 through 4096
 
-Examples:
-  ptymux work "pwd"
-  ptymux work "cd /tmp"
-  ptymux send -t 500ms work "pwd"
-  ptymux text work "hello world"
-  ptymux command work "ctrl-c"
-  ptymux keys work "up enter"
-  ptymux keys -f work "pageup"
-  ptymux read -n 3 work
-  ptymux follow work
-  ptymux kill work
-
-Options:
-  --socket PATH    use a custom daemon socket
-  -f               follow output until interrupted
-  -t DURATION      wait until PTY output is quiet; bare numbers are ms
-  -n N             read the recent N terminal command regions
-
-Default socket:
-  ~/.ptymux/sockets/ptymux-default.sock
-
-Output:
-  clean text by default; terminal color/title/cursor controls are removed
+Terminal output:
+  read returns the current terminal screen with ANSI styling
+  read -n N returns the most recent N ANSI terminal history lines
+  follow streams future raw PTY output in real time
 
 Config:
-  ~/.ptymux/config.json
+  ~/.ptymux/config (preferred)
+  ~/.ptymux/config.json (legacy fallback)
   shell defaults to /bin/sh
-  auto_release.enabled defaults to true
   auto_release.target_idle_timeout defaults to 8h
   auto_release.daemon_idle_timeout defaults to 30m
-  restart with ptymux stop after changing daemon config
 `, "\n")
+}
+
+func ClientHelpText() string {
+	return strings.TrimLeft(`
+ptymux-client - remote ptymux client
+
+Registration:
+  ptymux-client register --url http://HOST [--token-file PATH] --name NAME
+
+Operations:
+  ptymux-client [connection options] create <target>
+  ptymux-client [connection options] list [target]
+  ptymux-client [connection options] send <target> <input>
+  ptymux-client [connection options] text <target> <text>
+  ptymux-client [connection options] keys <target> <keys>
+  ptymux-client [connection options] read [-n N] <target>
+  ptymux-client [connection options] follow <target>
+  ptymux-client [connection options] close <target>
+  ptymux-client [connection options] rotate
+  ptymux-client [connection options] revoke
+  ptymux-client ALIAS <operation> ...
+
+Connection options:
+  --url URL --token VALUE|--token-file PATH --name NAME
+  --password VALUE|--password-file PATH
+  Default token: ~/.ptymux/client/server.token
+  Default password: ~/.ptymux/client/<client-name>.password
+  Aliases: ~/.ptymux/client/config
+
+Targets:
+  work             -> work/default/default
+  work/main        -> work/main/default
+  work/main/build  -> work/main/build
+  Each component: valid UTF-8, at most 64 bytes, no slash/control characters
+  Command/input text: at most 128 KiB; read -n N: 0 through 4096
+
+Transport security:
+  remote traffic uses unencrypted HTTP/WS and must stay on a trusted network
+`, "\n")
+}
+
+func ServerHelpText() string {
+	return strings.TrimLeft(`
+ptymux-server - remote ptymux HTTP/WS server
+
+Usage:
+  ptymux-server [--listen ADDRESS] [--token-file PATH] \
+    [--client-registry PATH] [--shell PATH]
+
+Defaults:
+  listen: 0.0.0.0:8443
+  token: ~/.ptymux/server/token
+  client registry: ~/.ptymux/server/clients.json
+
+Optional limits:
+  --max-pre-auth-connections N
+  --max-connections N
+  --max-connections-per-client N
+  --max-targets-per-client N
+  --auth-rate N
+  --auth-burst N
+
+Transport security:
+  traffic uses unencrypted HTTP/WS and must stay on a trusted network
+`, "\n")
+}
+
+func HelpText() string {
+	return LocalHelpText() + "\n" + ServerHelpText() + "\n" + ClientHelpText()
 }
 
 func parseWait(value string) (time.Duration, error) {

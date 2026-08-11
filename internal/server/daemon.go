@@ -7,24 +7,40 @@ import (
 	"io"
 	"net"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 )
 
 type Daemon struct {
-	store        *Store
-	shell        string
-	listener     net.Listener
-	stopOnce     sync.Once
-	stopped      chan struct{}
-	options      DaemonOptions
+	service *Service
+	store   *Store
+	options DaemonOptions
+
+	lifecycleMu sync.Mutex
+	listener    *net.UnixListener
+	connections map[net.Conn]bool
+	stopping    bool
+	stopAck     chan struct{}
+	stopAckOnce sync.Once
+	stopOnce    sync.Once
+	stopped     chan struct{}
+	handlers    sync.WaitGroup
+
 	activityMu   sync.Mutex
 	lastActivity time.Time
 }
 
+const (
+	defaultMaxLocalConnections = 128
+	defaultLocalRequestTimeout = 5 * time.Second
+	defaultLocalWriteTimeout   = 5 * time.Second
+)
+
 type DaemonOptions struct {
-	AutoRelease AutoReleaseOptions
+	AutoRelease           AutoReleaseOptions
+	MaxConnections        int
+	InitialRequestTimeout time.Duration
+	WriteTimeout          time.Duration
 }
 
 type AutoReleaseOptions struct {
@@ -39,16 +55,27 @@ func NewDaemon(shell string) *Daemon {
 }
 
 func NewDaemonWithOptions(shell string, options DaemonOptions) *Daemon {
+	if options.MaxConnections <= 0 {
+		options.MaxConnections = defaultMaxLocalConnections
+	}
+	if options.InitialRequestTimeout <= 0 {
+		options.InitialRequestTimeout = defaultLocalRequestTimeout
+	}
+	if options.WriteTimeout <= 0 {
+		options.WriteTimeout = defaultLocalWriteTimeout
+	}
+	service := NewService(shell)
 	return &Daemon{
-		store:        NewStore(),
-		shell:        shell,
+		service:      service,
+		store:        service.Store(),
+		connections:  make(map[net.Conn]bool),
 		stopped:      make(chan struct{}),
 		options:      options,
 		lastActivity: time.Now(),
 	}
 }
 
-func (d *Daemon) Serve(socketPath string) error {
+func (d *Daemon) Serve(socketPath string) (serveErr error) {
 	if socketPath == "" {
 		return errors.New("missing socket path")
 	}
@@ -56,213 +83,214 @@ func (d *Daemon) Serve(socketPath string) error {
 		return err
 	}
 
-	listener, err := net.Listen("unix", socketPath)
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
 	if err != nil {
 		return err
 	}
-	d.listener = listener
-	defer listener.Close()
-	defer os.Remove(socketPath)
-	defer d.store.CloseAll()
-	d.startCleanupLoop()
+	listener.SetUnlinkOnClose(false)
+	createdSocket, err := os.Lstat(socketPath)
+	if err != nil {
+		_ = listener.Close()
+		return fmt.Errorf("inspect created socket: %w", err)
+	}
 
+	d.lifecycleMu.Lock()
+	if d.stopping {
+		d.lifecycleMu.Unlock()
+		_ = listener.Close()
+		return cleanupSocketPath(socketPath, createdSocket)
+	}
+	d.listener = listener
+	d.lifecycleMu.Unlock()
+
+	d.startCleanupLoop()
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			select {
-			case <-d.stopped:
-				return nil
-			default:
+			if d.Stopped() {
+				break
 			}
-			return err
+			serveErr = err
+			d.requestStop(false)
+			break
 		}
-		go d.handle(conn)
+		if !d.registerConnection(conn) {
+			_ = conn.Close()
+			continue
+		}
+		d.handlers.Add(1)
+		go d.handleTracked(conn)
 	}
+
+	d.service.StopAdmission()
+	d.closeReadingConnections()
+	d.waitForStopAck()
+	d.closeAcceptedConnections()
+	if err := d.service.CloseAll(); err != nil && serveErr == nil {
+		serveErr = err
+	}
+	d.service.WaitOperations()
+	d.handlers.Wait()
+	_ = listener.Close()
+	if err := cleanupSocketPath(socketPath, createdSocket); err != nil && serveErr == nil {
+		serveErr = err
+	}
+	return serveErr
 }
 
-func prepareSocketPath(socketPath string) error {
-	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
-		return err
+func (d *Daemon) registerConnection(conn net.Conn) bool {
+	d.lifecycleMu.Lock()
+	defer d.lifecycleMu.Unlock()
+	if d.stopping || len(d.connections) >= d.options.MaxConnections {
+		return false
 	}
-	_ = os.Remove(socketPath)
-	return nil
+	d.connections[conn] = false
+	return true
+}
+
+func (d *Daemon) markConnectionActive(conn net.Conn) {
+	d.lifecycleMu.Lock()
+	if _, ok := d.connections[conn]; ok {
+		d.connections[conn] = true
+	}
+	d.lifecycleMu.Unlock()
+}
+
+func (d *Daemon) removeConnection(conn net.Conn) {
+	d.lifecycleMu.Lock()
+	delete(d.connections, conn)
+	d.lifecycleMu.Unlock()
+}
+
+func (d *Daemon) handleTracked(conn net.Conn) {
+	defer d.handlers.Done()
+	d.handle(conn)
 }
 
 func (d *Daemon) handle(conn net.Conn) {
+	defer d.removeConnection(conn)
 	defer conn.Close()
 
-	var req Request
-	if err := json.NewDecoder(conn).Decode(&req); err != nil {
-		_ = json.NewEncoder(conn).Encode(Response{Error: err.Error()})
+	if err := conn.SetReadDeadline(time.Now().Add(d.options.InitialRequestTimeout)); err != nil {
 		return
 	}
-	d.markActivity()
-	if req.Action == "follow" || req.Action == "ctrl-c" || (req.Action == "send" && req.Follow) || (req.Action == "command" && req.Follow) || (req.Action == "keys" && req.Follow) {
-		if req.Action == "command" {
-			if _, err := parseKeySequence(req.Command); err != nil {
-				_ = json.NewEncoder(conn).Encode(Response{Error: err.Error()})
-				return
-			}
+	var req Request
+	if err := DecodeLocalRequest(conn, &req); err != nil {
+		d.writeResponse(conn, Response{Error: err.Error()})
+		return
+	}
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		d.writeResponse(conn, Response{Error: err.Error()})
+		return
+	}
+	d.markConnectionActive(conn)
+	if req.Action == "stop" {
+		ack := d.requestStop(true)
+		d.writeResponse(conn, Response{})
+		if ack != nil {
+			d.stopAckOnce.Do(func() { close(ack) })
 		}
-		if req.Action == "keys" {
-			if _, err := parseKeySequenceNoEnter(req.Command); err != nil {
-				_ = json.NewEncoder(conn).Encode(Response{Error: err.Error()})
-				return
-			}
+		return
+	}
+	if req.Action == LocalStreamEnvelopeAction {
+		d.markActivity()
+		d.handleFramedStream(conn, req)
+		return
+	}
+	if IsStreamRequest(req) {
+		d.markActivity()
+		if err := ValidateStreamRequest(req); err != nil {
+			d.writeResponse(conn, Response{Error: err.Error()})
+			return
 		}
 		d.handleStream(conn, req)
 		return
 	}
 
-	resp := d.Handle(req)
-	_ = json.NewEncoder(conn).Encode(resp)
+	clientDone := monitorDisconnect(conn)
+	resp := d.HandleWithDone(req, clientDone)
+	d.writeResponse(conn, resp)
 }
 
-func (d *Daemon) handleStream(conn net.Conn, req Request) {
+func monitorDisconnect(conn net.Conn) <-chan struct{} {
 	clientDone := make(chan struct{})
 	go func() {
 		_, _ = io.Copy(io.Discard, conn)
 		close(clientDone)
 	}()
+	return clientDone
+}
 
-	tab, finish := d.beginTargetUse(req)
-	defer finish()
-	var err error
-	switch req.Action {
-	case "ctrl-c":
-		err = tab.Runner.CtrlCFollow(conn, clientDone)
-	case "follow":
-		err = tab.Runner.Follow(conn, clientDone)
-	case "command":
-		err = tab.Runner.CommandFollow(req.Command, conn, clientDone)
-	case "keys":
-		err = tab.Runner.KeysFollow(req.Command, conn, clientDone)
-	default:
-		err = tab.Runner.SendFollow(req.Command, conn, clientDone)
+type deadlineWriter struct {
+	conn    net.Conn
+	timeout time.Duration
+}
+
+func (w deadlineWriter) Write(data []byte) (int, error) {
+	if err := w.conn.SetWriteDeadline(time.Now().Add(w.timeout)); err != nil {
+		return 0, err
 	}
-	if err != nil {
-		_, _ = io.WriteString(conn, err.Error()+"\n")
+	return w.conn.Write(data)
+}
+
+func (d *Daemon) writeResponse(conn net.Conn, response Response) {
+	_ = conn.SetWriteDeadline(time.Now().Add(d.options.WriteTimeout))
+	_ = json.NewEncoder(conn).Encode(response)
+}
+
+func (d *Daemon) handleStream(conn net.Conn, req Request) {
+	clientDone := monitorDisconnect(conn)
+	writer := deadlineWriter{conn: conn, timeout: d.options.WriteTimeout}
+	if err := d.service.Stream(req, writer, clientDone, true); err != nil {
+		_, _ = io.WriteString(writer, err.Error()+"\n")
 	}
 }
 
-func (d *Daemon) beginTargetUse(req Request) (*Tab, func()) {
-	return d.store.BeginUse(req.Session, req.Pane, req.Tab, func() Runner {
-		runner, err := NewPTYRunner(d.shell)
-		if err != nil {
-			return &errorRunner{err: err}
+func (d *Daemon) handleFramedStream(conn net.Conn, envelope Request) {
+	writer := deadlineWriter{conn: conn, timeout: d.options.WriteTimeout}
+	if err := WriteLocalStreamFrame(writer, LocalStreamFrameStarted, nil); err != nil {
+		return
+	}
+	streamRequest := envelope
+	streamRequest.Action = envelope.StreamAction
+	streamRequest.StreamAction = ""
+	streamRequest.StreamVersion = 0
+	streamRequest.Follow = true
+
+	var streamErr error
+	if envelope.StreamVersion != LocalStreamVersion || !IsStreamRequest(streamRequest) {
+		streamErr = errors.New("unsupported local stream request")
+	} else {
+		clientDone := monitorDisconnect(conn)
+		streamErr = d.service.Stream(streamRequest, LocalStreamWriter{Writer: writer}, clientDone, true)
+	}
+	if streamErr != nil {
+		payload := []byte(streamErr.Error())
+		if len(payload) > MaxLocalStreamErrorBytes {
+			payload = payload[:completeUTF8Prefix(payload[:MaxLocalStreamErrorBytes])]
 		}
-		return runner
-	})
+		if err := WriteLocalStreamFrame(writer, LocalStreamFrameError, payload); err != nil {
+			return
+		}
+	}
+	_ = WriteLocalStreamFrame(writer, LocalStreamFrameEnd, nil)
 }
 
 func (d *Daemon) Handle(req Request) Response {
+	return d.HandleWithDone(req, nil)
+}
+
+func (d *Daemon) HandleWithDone(req Request, clientDone <-chan struct{}) Response {
 	d.markActivity()
-	switch req.Action {
-	case "run":
-		tab, done := d.beginTargetUse(req)
-		defer done()
-		result, err := tab.Runner.Run(req.Command)
-		if err != nil {
-			return Response{Error: err.Error()}
-		}
-		return Response{Output: result.Output, ExitCode: result.ExitCode}
-	case "idle":
-		tab, done := d.beginTargetUse(req)
-		defer done()
-		wait := time.Duration(req.WaitMillis) * time.Millisecond
-		if wait <= 0 {
-			wait = 500 * time.Millisecond
-		}
-		result, err := tab.Runner.SendWait(req.Command, wait)
-		if err != nil {
-			return Response{Error: err.Error()}
-		}
-		return Response{Output: result.Output, ExitCode: result.ExitCode}
-	case "send":
-		tab, done := d.beginTargetUse(req)
-		defer done()
-		if req.WaitMillis > 0 {
-			result, err := tab.Runner.SendWait(req.Command, time.Duration(req.WaitMillis)*time.Millisecond)
-			if err != nil {
-				return Response{Error: err.Error()}
-			}
-			return Response{Output: result.Output, ExitCode: result.ExitCode}
-		}
-		if err := tab.Runner.Send(req.Command); err != nil {
-			return Response{Error: err.Error()}
-		}
-		return Response{}
-	case "text":
-		tab, done := d.beginTargetUse(req)
-		defer done()
-		if err := tab.Runner.Text(req.Command); err != nil {
-			return Response{Error: err.Error()}
-		}
-		return Response{}
-	case "command":
-		tab, done := d.beginTargetUse(req)
-		defer done()
-		if req.WaitMillis > 0 {
-			result, err := tab.Runner.CommandWait(req.Command, time.Duration(req.WaitMillis)*time.Millisecond)
-			if err != nil {
-				return Response{Error: err.Error()}
-			}
-			return Response{Output: result.Output, ExitCode: result.ExitCode}
-		}
-		if err := tab.Runner.Command(req.Command); err != nil {
-			return Response{Error: err.Error()}
-		}
-		return Response{}
-	case "keys":
-		tab, done := d.beginTargetUse(req)
-		defer done()
-		if req.WaitMillis > 0 {
-			result, err := tab.Runner.KeysWait(req.Command, time.Duration(req.WaitMillis)*time.Millisecond)
-			if err != nil {
-				return Response{Error: err.Error()}
-			}
-			return Response{Output: result.Output, ExitCode: result.ExitCode}
-		}
-		if err := tab.Runner.Keys(req.Command); err != nil {
-			return Response{Error: err.Error()}
-		}
-		return Response{}
-	case "read":
-		tab, done := d.beginTargetUse(req)
-		defer done()
-		result, err := tab.Runner.Read(req.ReadCount)
-		if err != nil {
-			return Response{Error: err.Error()}
-		}
-		return Response{Output: result.Output, ExitCode: result.ExitCode}
-	case "list":
-		if req.Session != "" && req.Pane != "" && req.Tab != "" {
-			d.store.TouchTarget(req.Session, req.Pane, req.Tab)
-		}
-		return Response{Snapshot: d.store.SnapshotTarget(req.Session, req.Pane, req.Tab)}
-	case "kill":
-		var err error
-		if req.Session == "" {
-			err = d.store.CloseAll()
-		} else {
-			err = d.store.CloseTarget(req.Session, req.Pane, req.Tab)
-		}
-		if err != nil {
-			return Response{Error: err.Error()}
-		}
-		return Response{}
-	case "stop":
-		if err := d.store.CloseAll(); err != nil {
-			return Response{Error: err.Error()}
-		}
-		go func() {
-			time.Sleep(50 * time.Millisecond)
-			d.requestStop()
-		}()
-		return Response{}
-	default:
-		return Response{Error: fmt.Sprintf("unknown action %q", req.Action)}
+	if req.Action != "stop" {
+		return d.service.HandleWithDone(req, true, clientDone)
 	}
+	d.requestStop(false)
+	if err := d.service.CloseAll(); err != nil {
+		return Response{Error: err.Error()}
+	}
+	d.service.WaitOperations()
+	return Response{}
 }
 
 func (d *Daemon) startCleanupLoop() {
@@ -293,10 +321,10 @@ func (d *Daemon) cleanupIdle(now time.Time) {
 	if !options.Enabled {
 		return
 	}
-	if err := d.store.CloseIdleTargets(now, options.TargetIdleTimeout); err != nil {
+	if err := d.service.CloseIdleTargets(now, options.TargetIdleTimeout); err != nil {
 		_, _ = fmt.Fprintln(os.Stderr, err)
 	}
-	if options.DaemonIdleTimeout <= 0 || !d.store.Empty() {
+	if options.DaemonIdleTimeout <= 0 || !d.service.Empty() {
 		return
 	}
 
@@ -304,7 +332,7 @@ func (d *Daemon) cleanupIdle(now time.Time) {
 	idleFor := now.Sub(d.lastActivity)
 	d.activityMu.Unlock()
 	if idleFor >= options.DaemonIdleTimeout {
-		d.requestStop()
+		d.requestStop(false)
 	}
 }
 
@@ -323,52 +351,57 @@ func (d *Daemon) Stopped() bool {
 	}
 }
 
-func (d *Daemon) requestStop() {
-	d.stopOnce.Do(func() {
-		close(d.stopped)
-		if d.listener != nil {
-			_ = d.listener.Close()
+func (d *Daemon) requestStop(withAck bool) chan struct{} {
+	d.service.StopAdmission()
+	d.lifecycleMu.Lock()
+	if !d.stopping {
+		d.stopping = true
+		if withAck {
+			d.stopAck = make(chan struct{})
 		}
-	})
+	}
+	ack := d.stopAck
+	listener := d.listener
+	d.lifecycleMu.Unlock()
+
+	d.stopOnce.Do(func() { close(d.stopped) })
+	if listener != nil {
+		_ = listener.Close()
+	}
+	return ack
 }
 
-type errorRunner struct {
-	err error
+func (d *Daemon) waitForStopAck() {
+	d.lifecycleMu.Lock()
+	ack := d.stopAck
+	d.lifecycleMu.Unlock()
+	if ack != nil {
+		<-ack
+	}
 }
 
-func (r *errorRunner) Run(string) (RunResult, error) { return RunResult{}, r.err }
-func (r *errorRunner) RunIdle(string) (RunResult, error) {
-	return RunResult{}, r.err
+func (d *Daemon) closeReadingConnections() {
+	d.lifecycleMu.Lock()
+	var connections []net.Conn
+	for conn, active := range d.connections {
+		if !active {
+			connections = append(connections, conn)
+		}
+	}
+	d.lifecycleMu.Unlock()
+	for _, conn := range connections {
+		_ = conn.Close()
+	}
 }
-func (r *errorRunner) Send(string) error { return r.err }
-func (r *errorRunner) SendWait(string, time.Duration) (RunResult, error) {
-	return RunResult{}, r.err
+
+func (d *Daemon) closeAcceptedConnections() {
+	d.lifecycleMu.Lock()
+	connections := make([]net.Conn, 0, len(d.connections))
+	for conn := range d.connections {
+		connections = append(connections, conn)
+	}
+	d.lifecycleMu.Unlock()
+	for _, conn := range connections {
+		_ = conn.Close()
+	}
 }
-func (r *errorRunner) SendFollow(string, io.Writer, <-chan struct{}) error {
-	return r.err
-}
-func (r *errorRunner) Text(string) error    { return r.err }
-func (r *errorRunner) Command(string) error { return r.err }
-func (r *errorRunner) CommandWait(string, time.Duration) (RunResult, error) {
-	return RunResult{}, r.err
-}
-func (r *errorRunner) CommandFollow(string, io.Writer, <-chan struct{}) error {
-	return r.err
-}
-func (r *errorRunner) Keys(string) error { return r.err }
-func (r *errorRunner) KeysWait(string, time.Duration) (RunResult, error) {
-	return RunResult{}, r.err
-}
-func (r *errorRunner) KeysFollow(string, io.Writer, <-chan struct{}) error {
-	return r.err
-}
-func (r *errorRunner) Follow(io.Writer, <-chan struct{}) error {
-	return r.err
-}
-func (r *errorRunner) CtrlCFollow(io.Writer, <-chan struct{}) error {
-	return r.err
-}
-func (r *errorRunner) Read(int) (RunResult, error) {
-	return RunResult{}, r.err
-}
-func (r *errorRunner) Close() error { return nil }

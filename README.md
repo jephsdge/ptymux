@@ -6,6 +6,13 @@
 processes behind named targets, so repeated commands can share shell state such
 as the current directory, environment variables, and an active SSH session.
 
+It provides three executables:
+
+- `ptymux`: the local Unix-socket client and automatically started daemon. The
+  optional `local` prefix remains available.
+- `ptymux-server`: a foreground HTTP/WS service that owns remote targets.
+- `ptymux-client`: a registered, authenticated client for remote targets.
+
 ## Target Paths
 
 A target is a path with up to three parts:
@@ -25,27 +32,36 @@ work/main/build  -> work/main/build
 ```
 
 Internally, those three parts map to `session`, `pane`, and `tab`. The CLI uses
-`target` as the public concept so day-to-day commands stay simple.
+`target` as the public concept so day-to-day commands stay simple. Each component
+must be valid UTF-8, is limited to 64 bytes, and cannot contain `/`, NUL, or
+control characters. Command/input text is limited to 128 KiB.
 
-Targets are created lazily. The first command for a target creates its backing
-`/bin/sh` process and PTY automatically.
+Local targets are created lazily. The first local command for a target creates
+its backing shell process and PTY automatically. Remote targets are created
+explicitly with `ptymux-client ... create <target>`.
 
 ## Install
 
-Build a static binary:
+Build the three static executables:
 
 ```sh
 ./scripts/build.sh
 ```
 
-The default output is `dist/ptymux` for Linux amd64 with `CGO_ENABLED=0`.
+The default Linux amd64 outputs use `CGO_ENABLED=0`:
 
-You can override the target:
+```text
+dist/ptymux
+dist/ptymux-client
+dist/ptymux-server
+```
+
+You can override the target platform or output directory:
 
 ```sh
 GOOS=linux GOARCH=arm64 ./scripts/build.sh
 GOOS=darwin GOARCH=arm64 ./scripts/build.sh
-OUT_DIR=. BIN_NAME=ptymux CGO_ENABLED=0 ./scripts/build.sh
+OUT_DIR=. CGO_ENABLED=0 ./scripts/build.sh
 ```
 
 To build the platform binaries used by the bundled skill wrapper:
@@ -62,15 +78,106 @@ Manual equivalent:
 
 ```sh
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/ptymux ./cmd/ptymux
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/ptymux-client ./cmd/ptymux-client
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/ptymux-server ./cmd/ptymux-server
 ```
 
-Optionally move it somewhere on your `PATH`:
+Optionally install the executables on your `PATH`:
 
 ```sh
-install -m 0755 dist/ptymux ~/.local/bin/ptymux
+install -m 0755 dist/ptymux dist/ptymux-client dist/ptymux-server ~/.local/bin/
 ```
 
+## Local, Server, And Client Executables
+
+`ptymux` is local-only. Adding the optional `local` prefix is equivalent:
+
+```sh
+ptymux work "pwd"
+ptymux local work "pwd"
+ptymux send work "ls"
+ptymux local send work "ls"
+```
+
+Local commands use the automatically started Unix-socket daemon described below.
+Remote operations use the separate `ptymux-client` and `ptymux-server`
+executables.
+
+Run a remote HTTP/WS server on port 8443 in the foreground after provisioning
+its global token:
+
+```sh
+ptymux-server
+```
+
+The default server paths are:
+
+```text
+~/.ptymux/server/token
+~/.ptymux/server/clients.json
+```
+
+The non-empty global token must already exist; ptymux does not generate it. The
+registry and its secure parent directory are created automatically. Explicit
+`--token-file` and `--client-registry` flags override these defaults. The server
+stays in the foreground and keeps targets alive until they exit, are closed, or
+the server stops. Targets do not survive a server or container restart.
+
+Token/password authentication is access control only. HTTP/WS does not encrypt
+credentials, commands, or output. Expose ptymux only on a trusted internal
+network, and never expose it directly to public or otherwise untrusted networks.
+
+Server protection defaults are 256 accepted TCP connections that have not yet
+successfully authenticated, 256 pending plus active authenticated WebSockets,
+16 authenticated WebSockets per client, and 64 targets per client. Registration
+attempts and failed authentication attempts use separate per-source token
+buckets, each refilling at 5 tokens per second with a burst of 20; successful
+authentication does not consume tokens. Override these defaults with
+`--max-pre-auth-connections`, `--max-connections`,
+`--max-connections-per-client`, `--max-targets-per-client`, `--auth-rate`, and
+`--auth-burst`.
+
+Install the shared server token at the client default path, then register a
+client name. The server prints a generated password exactly once:
+
+```sh
+install -d -m 0700 ~/.ptymux/client
+install -m 0600 /path/to/server-token ~/.ptymux/client/server.token
+umask 077
+password_tmp="$(mktemp ~/.ptymux/client/tianyijie.password.XXXXXX)"
+if ptymux-client register \
+  --url http://host:8443 \
+  --name tianyijie > "$password_tmp"; then
+  mv "$password_tmp" ~/.ptymux/client/tianyijie.password
+else
+  rm -f "$password_tmp"
+  false
+fi
+```
+
+The default token and name-derived password paths are used automatically:
+
+```sh
+ptymux-client --url http://host:8443 --name tianyijie create work
+ptymux-client --url http://host:8443 --name tianyijie \
+  send work "relay-cli login -u tianyijie"
+```
+
+Explicit `--token`, `--token-file`, `--password`, and `--password-file` options
+remain available and override the default files.
+
+Remote operations are `create`, `list`, `send`, `text`, `keys`, `read`,
+`follow`, and `close`. `send` presses Enter, `text` does not, and `keys` sends
+named key sequences. `Ctrl+C` ends a remote `follow` without closing the target.
+Remote operations other than `create` and `list` require an existing target.
+
+Each registered client receives an internal immutable owner identity. Its target
+namespace is private: another client cannot list, read, write, follow, or close
+its targets, even when both clients use the same target name.
+
 ## Basic Usage
+
+The commands in this section use implicit local mode.
 
 Show CLI help:
 
@@ -121,7 +228,12 @@ ptymux work "git status"
 ```
 
 It appends an internal completion marker, waits for that marker, filters it from
-output, and returns the command exit code. Use this for normal shell commands.
+output, and returns the command exit code. Run mode has no fixed execution
+timeout. Pressing `Ctrl+C` interrupts the current local command, waits for the
+shell to resynchronize, and keeps the target available for later commands.
+Captured command output is bounded at 8 MiB; if that limit is reached, ptymux
+continues draining the command to completion and prints a truncation warning.
+Use this mode for normal shell commands.
 
 ### Idle Mode
 
@@ -137,7 +249,10 @@ Idle mode does not append a marker. It sends the command and returns after PTY
 output has been quiet for 500ms. It is equivalent to `send -t 500ms`.
 
 Idle mode is heuristic. Commands with delayed output, such as
-`sleep 2 && echo done`, can return before all output arrives.
+`sleep 2 && echo done`, can return before all output arrives. The quiet duration
+is not a total timeout: every output chunk restarts it, so continuously producing
+commands can keep the request open indefinitely. Captured quiet-wait output is
+also bounded at 8 MiB while ptymux continues waiting for the quiet boundary.
 
 ### Send Mode
 
@@ -149,7 +264,8 @@ ptymux send work "ls"
 ```
 
 By default, `send` writes input and returns without printing output. The
-background reader keeps recording terminal state and command history.
+background reader keeps the current screen and bounded ANSI terminal-line
+history up to date.
 
 Follow output after sending:
 
@@ -244,32 +360,39 @@ This writes the ETX byte (`0x03`) to the target PTY and follows output, just lik
 
 ### Read Mode
 
-Read the current terminal screen:
+Read the current terminal screen with ANSI styling:
 
 ```sh
 ptymux read work
 ```
 
-Read recent command transcript entries:
+Read the most recent ANSI terminal history lines:
 
 ```sh
 ptymux read -n 3 work
 ```
 
-Entries are returned from oldest to newest within the selected recent window.
-`read` is read-only and does not block commands running in other clients.
+Lines are returned from oldest to newest within the selected window. This is
+bounded, line-oriented terminal history, not command history or full scrollback.
+`N` must be between 0 and 4096; zero selects the current screen like plain
+`read`. While an alternate screen is active, `read -n N` returns its last `N` visible
+rows. `read` is read-only and does not block commands running in other clients.
 
 ### Follow Mode
 
-Stream future PTY output without sending input:
+Stream future raw PTY output without sending input:
 
 ```sh
 ptymux follow work
 ```
 
-Stop observing with `Ctrl+C`; the target remains alive.
-`follow` is read-only and subscribes to future output without locking the
-target.
+Stop observing with `Ctrl+C`; the target remains alive. `follow` preserves ANSI
+and other terminal control sequences, does not replay the current screen or
+history, and does not lock the target. With a current daemon, local streaming
+failures are kept separate from terminal bytes: they are printed on stderr and
+return a non-zero status. New clients can still use older daemons, but legacy
+streaming may mix daemon errors into stdout and may return a zero status. Run
+`ptymux stop` to restart the daemon and use the current behavior.
 
 ### Kill Mode
 
@@ -317,6 +440,9 @@ Stop the daemon and close all managed shells:
 ptymux stop
 ```
 
+Once shutdown starts, the daemon stops admitting new operations before it
+closes targets and waits for accepted requests to finish.
+
 Close one target without stopping the daemon:
 
 ```sh
@@ -330,7 +456,10 @@ The default socket path is:
 ```
 
 `ptymux` creates the `~/.ptymux/sockets` directory automatically when the daemon
-starts.
+starts. A custom socket path never replaces a regular file, directory, or
+symlink. An existing Unix socket is removed only when it belongs to the current
+user and is confirmed stale; shutdown removes only the socket created by that
+daemon.
 
 Use a custom socket when you want a separate daemon:
 
@@ -339,19 +468,14 @@ ptymux --socket /tmp/project-a.sock work "pwd"
 ptymux --socket /tmp/project-a.sock stop
 ```
 
-## Configuration
+## Configuration And Remote Aliases
 
-`ptymux` reads optional user configuration from:
-
-```text
-~/.ptymux/config.json
-```
-
-Default configuration:
+Local daemon settings remain in `~/.ptymux/config`, with
+`~/.ptymux/config.json` as a legacy fallback:
 
 ```json
 {
-  "shell": "/bin/sh",
+  "shell": "/bin/bash",
   "auto_release": {
     "enabled": true,
     "target_idle_timeout": "8h",
@@ -360,38 +484,127 @@ Default configuration:
 }
 ```
 
-`shell` controls the program used for newly created targets. Use `/bin/bash`
-when you want bash prompt behavior and aliases from your bash configuration:
+Remote aliases are loaded only from the private file
+`~/.ptymux/client/config`:
 
 ```json
 {
-  "shell": "/bin/bash"
+  "clients": {
+    "relay": {
+      "url": "http://host:8443",
+      "name": "tianyijie"
+    }
+  }
 }
 ```
 
-`target_idle_timeout` releases a target after it has not been used for the
-configured duration. Releasing a target closes its shell and loses that target's
-current directory, environment, and interactive state.
+This is an incompatible alias-path migration: remote `clients` entries in
+`~/.ptymux/config` and `~/.ptymux/config.json` are ignored. The new client
+config and all client secret files must be private regular non-symlink files;
+use mode `0600` and keep `~/.ptymux/client` at mode `0700`. An alias may still
+set `token_file` and `password_file` to override the default secret paths.
 
-`daemon_idle_timeout` stops an empty daemon after it has had no client requests
-for the configured duration. Stopping the daemon removes its socket. The next
-`ptymux` command starts a new daemon automatically.
+The alias makes remote commands shorter:
 
-Set either timeout to `"0"` to disable that specific release behavior, or set
-`enabled` to `false` to disable automatic release entirely.
+```sh
+ptymux-client relay create work
+ptymux-client relay send work "relay-cli login -u tianyijie"
+ptymux-client relay read -n 20 work
+ptymux-client relay follow work
+ptymux-client relay keys work ctrl-c
+ptymux-client relay close work
+```
 
-Configuration is read when the daemon starts. Restart the daemon with
-`ptymux stop` for configuration changes to affect an already running daemon.
+Explicit connection flags override alias fields. Prefer `token_file` and
+`password_file` over inline `token` and `password` fields or CLI values so
+secrets do not appear in shell history or process listings. Secret files must be
+private regular files, must not be symlinks, and should use mode `0600`.
+
+The top-level `shell` and `auto_release` settings apply to the local daemon.
+`shell` defaults to `/bin/sh`. `target_idle_timeout` defaults to `8h`, and
+`daemon_idle_timeout` defaults to `30m`. Set a timeout to `"0"` to disable that
+specific release behavior, or set `enabled` to `false` to disable local
+automatic release entirely. Restart the local daemon with `ptymux stop` after
+changing these settings.
+
+## Rotate Or Revoke A Remote Client
+
+Rotate a client password while preserving its owner identity and targets. Set
+`password_file` below to the alias's actual `password_file` path, or use the
+name-derived default when the alias has no override. Migrate inline alias
+passwords to a private password file before rotating.
+
+```sh
+umask 077
+password_file="$HOME/.ptymux/client/tianyijie.password"
+password_tmp="$(mktemp "${password_file}.XXXXXX")"
+if ptymux-client relay rotate > "$password_tmp"; then
+  mv -- "$password_tmp" "$password_file"
+else
+  rm -f "$password_tmp"
+  false
+fi
+```
+
+Do not redirect rotation directly over the current password file: the shell
+would truncate it before ptymux could authenticate with the old password.
+
+Rotation invalidates the old password and connections authenticated with the old
+credential generation. Revoke a client and close only that owner's connections
+and targets:
+
+```sh
+ptymux-client relay revoke
+```
+
+A revoked name can be registered again, but it receives a new owner identity and
+does not regain access to old targets.
+
+## Relay Docker Image
+
+The deployment Dockerfile lives in the separate `xiaogang_pty` checkout and
+builds ptymux through named BuildKit contexts. Set both checkout paths explicitly:
+
+```sh
+ptymux_src=/path/to/ptymux
+xiaogang_pty=/path/to/xiaogang_pty
+gomod_cache="$(go env GOMODCACHE)"
+docker build --network host \
+  --build-context ptymux-src="$ptymux_src" \
+  --build-context gomod-cache="$gomod_cache" \
+  -t ptymux-relay:dev \
+  -f "$xiaogang_pty/Dockerfile" "$xiaogang_pty"
+```
+
+Run it with only the token file mounted read-only and a persistent registry
+volume:
+
+```sh
+docker run --rm -p 8443:8443 \
+  -v "$PWD/secrets/ptymux.token:/run/secrets/ptymux.token:ro" \
+  -v ptymux-data:/var/lib/ptymux \
+  --name relay-dev \
+  ptymux-relay:dev
+```
+
+The image runs `ptymux-server` as the non-root `work` user, installs
+`relay-cli`, and stores the client registry in `/var/lib/ptymux`. The registry
+survives container replacement when the volume is retained; running shells do
+not.
 
 ## Notes
 
 - Each full target path resolves to a long-lived shell process attached to a PTY.
 - PTY output is combined stdout/stderr, like a normal terminal.
-- Output returned to clients is clean text by default. Terminal color, title,
-  cursor, and line-control sequences are removed while prompt text is preserved.
-- `send -f`, `follow`, and `ctrl-c` stream output until the client disconnects.
-- There is no full interactive attach mode yet; input is still sent one command
-  at a time.
+- Completed command and quiet-wait output is cleaned of terminal controls while
+  preserving prompt text. `read` returns ANSI-styled screen or history output.
+- `send -f`, key-follow modes, and `ctrl-c` stream cleaned output. Local and
+  remote `follow` stream only future raw PTY output; disconnecting the follower
+  does not stop the target.
+- Disconnecting a remote client does not close its targets. Use remote `close`,
+  client `revoke`, or server shutdown when the target should stop.
+- There is no full interactive attach mode in the first remote version; input is
+  sent with `send`, `text`, or `keys`.
 
 ## License
 

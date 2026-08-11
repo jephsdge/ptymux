@@ -19,52 +19,77 @@ name/group/shell
 ```
 
 Internally those map to `session`, `pane`, and `tab`. The public docs should
-prefer the word `target`.
+prefer the word `target`. Target components are valid UTF-8, at most 64 bytes,
+and exclude `/`, NUL, and control characters. Input is capped at 128 KiB;
+`read -n` accepts 0 through 4096.
 
 ## Current Architecture
 
-- `cmd/ptymux/main.go`
-  CLI entrypoint. Parses config, calls `app.Run`, prints response output or
-  target lists.
+- `cmd/ptymux/main.go`, `cmd/ptymux-client/main.go`, and
+  `cmd/ptymux-server/main.go`
+  Separate Local, Remote client, and Remote server entrypoints. `ptymux` retains
+  the internal Local daemon action used by automatic daemon startup.
 
 - `internal/app/parse.go`
-  CLI argument parsing. Supports default run mode plus `idle`, `send`,
-  `text`, `command`, `keys`, `ctrl-c`, `read`, `follow`, `list`, `stop`,
-  `kill`, `daemon`, and `help`.
+  Shared CLI argument parsing with role-specific `ParseLocal`, `ParseClient`, and
+  `ParseServer` entrypoints. Existing local commands remain compatible; remote
+  operations are `register`, `rotate`, `revoke`, `create`, `list`, `send`,
+  `text`, `keys`, `read`, `follow`, and `close`.
 
 - `internal/app/client.go`
   Client-side daemon communication. Starts the daemon automatically when needed.
   Streaming commands use a Unix socket stream instead of JSON response decoding.
   The default socket is `~/.ptymux/sockets/ptymux-default.sock`.
 
-- `internal/app/config.go`
-  Loads optional user configuration from `~/.ptymux/config.json`. Defaults use
-  `/bin/sh` as the target shell and enable automatic release with an 8h target
-  idle timeout and a 30m empty daemon idle timeout.
+- `internal/app/config.go` and `internal/app/remote_config.go`
+  Load local settings from `~/.ptymux/config`, with `~/.ptymux/config.json` as a
+  legacy fallback. Remote aliases are loaded only from
+  `~/.ptymux/client/config`; old local config files are not a remote alias
+  fallback. Remote profiles and secret files are validated before networking.
+  Local defaults use `/bin/sh` with an 8h target idle timeout and a 30m empty
+  daemon idle timeout.
 
-- `internal/server/daemon.go`
-  Unix socket server. Decodes requests, locates/creates target runners, and
-  dispatches actions. Owns automatic release scheduling for idle targets and
-  empty daemons.
+- `internal/server/service.go` and `internal/server/daemon.go`
+  `Service` provides transport-independent target operations with a shutdown
+  admission barrier. The daemon owns accepted-handler shutdown, identity-safe
+  Unix socket cleanup, local automatic release scheduling, a 128-connection
+  default limit, 5s initial-request deadlines, and 5s per-write deadlines.
 
 - `internal/server/store.go`
-  In-memory session/pane/tab target store. Targets are created lazily and track
-  last-used time plus active use counts for automatic release.
+  In-memory session/pane/tab target store. Concurrent creation uses startup
+  placeholders so shell startup and shutdown happen outside the store lock.
+  Targets track last-used time plus active use counts for automatic release.
 
 - `internal/server/tab.go`
   Core PTY runner. Each runner owns one shell process, one PTY, one background
   reader goroutine, a virtual terminal, and live output subscribers.
 
 - `internal/server/cleaner.go`
-  Terminal output cleaner. It removes terminal control sequences and applies
-  basic line semantics so command and stream output is stable clean text for
-  agents.
+  Terminal output cleaner for completed command/quiet-wait results and input-
+  follow streams such as `send -f`, key-follow modes, and `ctrl-c`. Standalone
+  `follow` bypasses it and forwards raw PTY bytes.
+
+- `internal/server/transcript.go`
+  Maintains bounded ANSI terminal-line history and renders ANSI-styled virtual
+  terminal screens for `read`. Alternate-screen output is excluded from normal
+  history; `CSI 3J` clears saved history.
 
 - `internal/server/keys.go`
   Parser for terminal key sequences used by `command` and `keys`.
 
-- `internal/server/protocol.go`
-  JSON request/response types shared by app and server.
+- `internal/server/protocol.go` and `internal/server/local_stream.go`
+  Bounded local request validation plus the versioned local stream protocol.
+  Streaming uses explicit started/data/error/end frames and falls back to the
+  legacy raw stream when a new client talks to an older daemon.
+
+- `internal/remote/`
+  Versioned HTTP/WS transport, persistent client registry, global-token and
+  client-password authentication, keyed token-bucket abuse limits, separate
+  pre-auth TCP and authenticated WebSocket limits, bounded targets/follow
+  delivery, credential rotation/revocation, and per-owner service isolation. Authentication is access control only: all
+  credentials, commands, and output are unencrypted, so expose the server only
+  on a trusted internal network and never directly to public or untrusted
+  networks.
 
 - `skills/use-ptymux/assets/ptymux`
   Skill-local wrapper committed with the usage skill. It selects the matching
@@ -77,14 +102,17 @@ Each `PTYRunner` has exactly one background reader goroutine. It is the only
 code path that reads from the PTY fd. The reader:
 
 - feeds bytes into `vt10x.Terminal`;
-- broadcasts output chunks to live subscribers;
+- records bounded ANSI terminal-line history;
+- broadcasts raw output chunks to live subscribers;
 - keeps terminal screen state current.
 
 Command methods must not read the PTY directly.
 
-PTY bytes should stay raw until they reach the command result or stream writer.
-Use `CleanTerminalString` for complete command/read output and
-`TerminalCleaner` for streaming output so split OSC/CSI sequences do not leak.
+Keep PTY chunks raw in the reader and subscriber layer. Use
+`CleanTerminalString` for completed command and quiet-wait results, and
+`TerminalCleaner` for cleaned input-follow streams. `read` renders ANSI-styled
+screen/history output, while standalone `follow` writes subscribed PTY chunks
+unchanged.
 
 Each target shell is started through `creack/pty`, which creates a new session
 and process group for the shell. Target shutdown must signal the shell process
@@ -95,14 +123,15 @@ Subscription types:
 
 - Reliable subscriptions are used by boundary-sensitive operations such as
   `run`, `idle`, and `send -t`; they must not drop marker or quiet-wait output.
-- Best-effort subscriptions are used by observers such as `follow`, `send -f`,
-  `command -f`, and legacy `ctrl-c`; slow observers must not block the runner.
+- Observer subscriptions are used by `follow`, `send -f`, `command -f`, and
+  legacy `ctrl-c`; a full subscriber queue disconnects only that slow observer
+  and must not block the runner or silently drop bytes.
 
 Locking rules:
 
 - `commandMu` serializes writes that need stable command boundaries.
-- `stateMu` protects terminal state, subscribers, history fields, and closed
-  state.
+- `stateMu` protects virtual-terminal state, ANSI transcript state, subscribers,
+  and closed/read-error state.
 - Do not hold `stateMu` while writing to client sockets.
 - Do not introduce another direct `syscall.Read` outside `readLoop`.
 
@@ -110,8 +139,11 @@ Locking rules:
 
 - Default run:
   `ptymux work "pwd"`
-  Appends an internal marker, waits for it, filters marker internals, returns
-  output and exit code.
+  Appends a random internal marker, waits without a fixed execution timeout,
+  filters marker internals, and returns output plus exit code. Local client
+  cancellation writes one ETX followed by a fresh marker command, waits for
+  shell resynchronization, and preserves the target. Captured output is bounded
+  to 8 MiB while marker detection continues beyond the capture limit.
 
 - Idle:
   `ptymux idle work "ssh host"`
@@ -124,7 +156,9 @@ Locking rules:
 
 - Send wait:
   `ptymux send -t 500ms work "pwd"`
-  Writes input, waits until output is quiet, returns output.
+  Writes input, waits until output is quiet, returns output. The duration is an
+  inactivity threshold with no separate total deadline; every chunk resets it.
+  Captured quiet-wait output is bounded to 8 MiB while draining continues.
 
 - Send follow:
   `ptymux send -f work "tail -f file"`
@@ -150,16 +184,19 @@ Locking rules:
 
 - Read:
   `ptymux read work`
-  Reads the virtual terminal screen and filters ptymux internal marker lines.
+  Renders the current virtual terminal screen with ANSI styling and filters
+  ptymux internal marker lines.
 
 - Read recent:
   `ptymux read -n 3 work`
-  Also reads from the virtual terminal screen, then extracts the recent command
-  regions in chronological order. It must not depend on internal history.
+  Returns the most recent `N` lines from bounded ANSI terminal history, oldest to
+  newest. It is line-oriented, not command history or full scrollback. While the
+  alternate screen is active, it returns the last `N` visible screen rows.
 
 - Follow:
   `ptymux follow work`
-  Read-only live subscription. It must not block other commands.
+  Read-only subscription that forwards future raw PTY chunks unchanged. It does
+  not replay screen/history and must not block other commands.
 
 - Kill:
   `ptymux kill work`
@@ -168,21 +205,51 @@ Locking rules:
   targets.
 
 - Auto release:
-  `~/.ptymux/config.json`
+  `~/.ptymux/config` (with `config.json` as a legacy fallback)
   Defaults to enabled. `target_idle_timeout` defaults to `8h` and releases idle
   targets. `daemon_idle_timeout` defaults to `30m` and stops an empty idle
   daemon, which removes its socket. A timeout of `0` disables that specific
   release behavior.
 
 - Shell configuration:
-  `~/.ptymux/config.json`
+  `~/.ptymux/config` (with `config.json` as a legacy fallback)
   `shell` defaults to `/bin/sh`. Set it to `/bin/bash` when users need bash
   prompt behavior or aliases. Configuration is read when the daemon starts;
   existing daemons and targets do not hot-reload shell changes.
 
+- Remote server:
+  `ptymux-server` defaults to `~/.ptymux/server/token` and
+  `~/.ptymux/server/clients.json`;
+  explicit flags override these paths. It uses HTTP on port 8443 and runs in the
+  foreground. A non-empty global token must be provisioned; the locked
+  persistent registry is created automatically. Pre-auth accepted TCP
+  connections, pending plus active authenticated WebSockets, per-client
+  WebSockets/targets, registration, and failed-authentication attempts have
+  separate limits configurable through server flags.
+
+- Remote client:
+  `ptymux-client register ...` creates a random owner identity and one-time
+  password. The default token is `~/.ptymux/client/server.token`, and ordinary
+  operations default to `~/.ptymux/client/<name>.password`. Remote aliases are
+  read only from `~/.ptymux/client/config`. Explicit values override alias
+  fields, which override default secret paths.
+  Explicit flags override alias fields.
+
+- Remote targets:
+  `create` is explicit. `send`, `text`, `keys`, `read`, `follow`, and `close`
+  require an existing target. Each OwnerID has an isolated `Service`, so equal
+  target names across clients do not share state. Client/follow disconnect does
+  not close the target. The first remote version has no attach mode.
+
+- Remote credentials:
+  `rotate` preserves OwnerID and targets while invalidating old-generation
+  connections. `revoke` closes only that owner's connections and targets.
+  Token/password authentication controls access but does not encrypt the HTTP/WS
+  transport; credentials, commands, and output remain plaintext.
+
 - Help:
   `ptymux -h`, `ptymux --help`, `ptymux help`, and subcommand help flags such
-  as `ptymux send -h` print local usage text and must not contact the daemon.
+  as `ptymux send -h` print usage text and must not contact a daemon or server.
 
 ## Internal Marker Rules
 
@@ -214,13 +281,14 @@ daemon streaming:
 go test -race ./... -count=1
 ```
 
-Build a static Linux amd64 binary:
+Build the static Linux amd64 executables:
 
 ```sh
 ./scripts/build.sh
 ```
 
-The default output is `dist/ptymux`. Verify static output with:
+The default outputs are `dist/ptymux`, `dist/ptymux-client`, and
+`dist/ptymux-server`. Verify each with `ldd` and `file`, for example:
 
 ```sh
 ldd dist/ptymux

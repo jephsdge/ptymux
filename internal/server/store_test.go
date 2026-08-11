@@ -125,6 +125,212 @@ func TestStoreCloseTargetClosesAndRemovesExactTarget(t *testing.T) {
 	}
 }
 
+func TestStoreStartsRunnerOutsideLockAndOnlyOnce(t *testing.T) {
+	store := NewStore()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startedOnce sync.Once
+	var callsMu sync.Mutex
+	calls := 0
+	factory := func() Runner {
+		callsMu.Lock()
+		calls++
+		callsMu.Unlock()
+		startedOnce.Do(func() { close(started) })
+		<-release
+		return &fakeRunner{}
+	}
+
+	firstResult := make(chan *Tab, 1)
+	go func() {
+		tab, done := store.BeginUse("work", "default", "default", factory)
+		if tab != nil {
+			done()
+		}
+		firstResult <- tab
+	}()
+	<-started
+
+	snapshotDone := make(chan Snapshot, 1)
+	go func() { snapshotDone <- store.Snapshot() }()
+	select {
+	case snapshot := <-snapshotDone:
+		if len(snapshot.Sessions) != 0 {
+			t.Fatalf("snapshot = %+v, want target hidden while starting", snapshot)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("Snapshot blocked while runner factory was running")
+	}
+
+	secondResult := make(chan *Tab, 1)
+	go func() {
+		tab, done := store.BeginUse("work", "default", "default", factory)
+		if tab != nil {
+			done()
+		}
+		secondResult <- tab
+	}()
+	close(release)
+
+	first := <-firstResult
+	second := <-secondResult
+	if first == nil || second == nil || first != second {
+		t.Fatalf("tabs = %p and %p, want same created target", first, second)
+	}
+	callsMu.Lock()
+	defer callsMu.Unlock()
+	if calls != 1 {
+		t.Fatalf("runner factory calls = %d, want 1", calls)
+	}
+}
+
+func TestStoreClosesTargetOutsideLock(t *testing.T) {
+	store := NewStore()
+	runner := &blockingCloseRunner{
+		fakeRunner: &fakeRunner{},
+		started:    make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	store.GetOrCreate("work", "default", "default", func() Runner { return runner })
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- store.CloseTarget("work", "default", "default")
+	}()
+	<-runner.started
+
+	snapshotDone := make(chan Snapshot, 1)
+	go func() { snapshotDone <- store.Snapshot() }()
+	select {
+	case snapshot := <-snapshotDone:
+		if len(snapshot.Sessions) != 0 {
+			t.Fatalf("snapshot = %+v, want target removed before close completes", snapshot)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("Snapshot blocked while runner was closing")
+	}
+
+	close(runner.release)
+	if err := <-closeDone; err != nil {
+		t.Fatalf("CloseTarget returned error: %v", err)
+	}
+}
+
+func TestStoreCloseAllCancelsStartingTarget(t *testing.T) {
+	store := NewStore()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	runner := &fakeRunner{}
+	result := make(chan *Tab, 1)
+	go func() {
+		tab, _ := store.BeginUse("work", "default", "default", func() Runner {
+			close(started)
+			<-release
+			return runner
+		})
+		result <- tab
+	}()
+	<-started
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- store.CloseAll() }()
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for {
+		store.mu.Lock()
+		starting := store.starting[targetKey{session: "work", pane: "default", tab: "default"}]
+		canceled := starting != nil && starting.canceled
+		store.mu.Unlock()
+		if canceled {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("CloseAll did not cancel starting target")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(release)
+
+	if err := <-closeDone; err != nil {
+		t.Fatalf("CloseAll returned error: %v", err)
+	}
+	if tab := <-result; tab != nil {
+		t.Fatalf("BeginUse returned tab %p, want canceled start", tab)
+	}
+	if !runner.closed {
+		t.Fatal("starting runner was not closed")
+	}
+	if snapshot := store.Snapshot(); len(snapshot.Sessions) != 0 {
+		t.Fatalf("snapshot = %+v, want no targets", snapshot)
+	}
+}
+
+func TestStoreCloseAllDoesNotRestartWaitingTarget(t *testing.T) {
+	store := NewStore()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startedOnce sync.Once
+	var callsMu sync.Mutex
+	calls := 0
+	factory := func() Runner {
+		callsMu.Lock()
+		calls++
+		callsMu.Unlock()
+		startedOnce.Do(func() { close(started) })
+		<-release
+		return &fakeRunner{}
+	}
+
+	firstResult := make(chan *Tab, 1)
+	go func() {
+		tab, _ := store.BeginUse("work", "default", "default", factory)
+		firstResult <- tab
+	}()
+	<-started
+
+	secondResult := make(chan *Tab, 1)
+	go func() {
+		tab, _ := store.BeginUse("work", "default", "default", factory)
+		secondResult <- tab
+	}()
+	time.Sleep(10 * time.Millisecond)
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- store.CloseAll() }()
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for {
+		store.mu.Lock()
+		starting := store.starting[targetKey{session: "work", pane: "default", tab: "default"}]
+		canceled := starting != nil && starting.canceled
+		store.mu.Unlock()
+		if canceled {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("CloseAll did not cancel starting target")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(release)
+
+	if err := <-closeDone; err != nil {
+		t.Fatalf("CloseAll returned error: %v", err)
+	}
+	if tab := <-firstResult; tab != nil {
+		t.Fatalf("first BeginUse returned tab %p, want nil", tab)
+	}
+	if tab := <-secondResult; tab != nil {
+		t.Fatalf("waiting BeginUse returned tab %p, want nil", tab)
+	}
+	callsMu.Lock()
+	defer callsMu.Unlock()
+	if calls != 1 {
+		t.Fatalf("runner factory calls = %d, want 1", calls)
+	}
+	if snapshot := store.Snapshot(); len(snapshot.Sessions) != 0 {
+		t.Fatalf("snapshot = %+v, want no targets", snapshot)
+	}
+}
+
 func TestDaemonKillTargetClosesOnlyTarget(t *testing.T) {
 	daemon := NewDaemon("")
 	targetRunner := &fakeRunner{}
@@ -444,6 +650,19 @@ type testAddr string
 
 func (a testAddr) Network() string { return "test" }
 func (a testAddr) String() string  { return string(a) }
+
+type blockingCloseRunner struct {
+	*fakeRunner
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (r *blockingCloseRunner) Close() error {
+	r.once.Do(func() { close(r.started) })
+	<-r.release
+	return r.fakeRunner.Close()
+}
 
 type fakeRunner struct {
 	closed            bool
