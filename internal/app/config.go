@@ -2,12 +2,21 @@ package app
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 
+	"ptymux/internal/remote"
 	"ptymux/internal/server"
+)
+
+const (
+	maxPrivateConfigSize = 1 << 20
+	maxPrivateSecretSize = 64 << 10
 )
 
 type UserConfig struct {
@@ -26,17 +35,27 @@ type rawAutoReleaseConfig struct {
 	DaemonIdleTimeout string `json:"daemon_idle_timeout"`
 }
 
+type serverDefaultPaths struct {
+	TokenFile      string
+	ClientRegistry string
+}
+
 func LoadUserConfig() (UserConfig, error) {
 	cfg := defaultUserConfig()
-	home, err := os.UserHomeDir()
+	path, err := ptymuxHomePath("config")
 	if err != nil {
 		return UserConfig{}, err
 	}
-
-	path := filepath.Join(home, ".ptymux", "config.json")
-	data, err := os.ReadFile(path)
+	data, err := readPrivateFile(path, maxPrivateConfigSize)
+	if err != nil && errors.Is(err, os.ErrNotExist) {
+		path, err = ptymuxHomePath("config.json")
+		if err != nil {
+			return UserConfig{}, err
+		}
+		data, err = readRegularFile(path, maxPrivateConfigSize, false)
+	}
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			return cfg, nil
 		}
 		return UserConfig{}, err
@@ -74,6 +93,80 @@ func LoadUserConfig() (UserConfig, error) {
 		cfg.AutoRelease.DaemonIdleTimeout = timeout
 	}
 	return cfg, nil
+}
+
+func defaultServerPaths() (serverDefaultPaths, error) {
+	dir, err := ptymuxHomePath("server")
+	if err != nil {
+		return serverDefaultPaths{}, err
+	}
+	return serverDefaultPaths{
+		TokenFile:      filepath.Join(dir, "token"),
+		ClientRegistry: filepath.Join(dir, "clients.json"),
+	}, nil
+}
+
+func defaultClientConfigPath() (string, error) {
+	return ptymuxHomePath("client", "config")
+}
+
+func defaultClientTokenPath() (string, error) {
+	return ptymuxHomePath("client", "server.token")
+}
+
+func defaultClientPasswordPath(name string) (string, error) {
+	if !remote.ValidClientName(name) {
+		return "", fmt.Errorf("invalid client name %q", name)
+	}
+	return ptymuxHomePath("client", name+".password")
+}
+
+func ptymuxHomePath(parts ...string) (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	pathParts := append([]string{home, ".ptymux"}, parts...)
+	return filepath.Join(pathParts...), nil
+}
+
+func readPrivateFile(path string, maxSize int64) ([]byte, error) {
+	return readRegularFile(path, maxSize, true)
+}
+
+func readRegularFile(path string, maxSize int64, private bool) ([]byte, error) {
+	flags := syscall.O_RDONLY | syscall.O_CLOEXEC | syscall.O_NONBLOCK
+	if private {
+		flags |= syscall.O_NOFOLLOW
+	}
+	fd, err := syscall.Open(path, flags, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", path, err)
+	}
+	file := os.NewFile(uintptr(fd), path)
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat %s: %w", path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s must be a regular file", path)
+	}
+	if private && info.Mode().Perm()&0o077 != 0 {
+		return nil, fmt.Errorf("%s must not be accessible by group or other users", path)
+	}
+	if info.Size() > maxSize {
+		return nil, fmt.Errorf("%s exceeds %d bytes", path, maxSize)
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	if int64(len(data)) > maxSize {
+		return nil, fmt.Errorf("%s exceeds %d bytes", path, maxSize)
+	}
+	return data, nil
 }
 
 func defaultUserConfig() UserConfig {

@@ -2,6 +2,8 @@ package server
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -10,40 +12,165 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/creack/pty"
 	"github.com/hinshun/vt10x"
 )
 
 type PTYRunner struct {
-	commandMu sync.Mutex
-	stateMu   sync.Mutex
-	file      *os.File
-	fd        int
-	command   *exec.Cmd
-	seq       uint64
-	term      vt10x.Terminal
-	history   []string
+	commandMu       sync.Mutex
+	stateMu         sync.Mutex
+	file            *os.File
+	fd              int
+	command         *exec.Cmd
+	term            vt10x.Terminal
+	terminalPending []byte
+	transcript      ansiTranscript
 
-	subscribers map[uint64]subscriber
-	nextSubID   uint64
-	closed      bool
-	readErr     error
-	readerDone  chan struct{}
+	subscribers   map[uint64]*subscriber
+	nextSubID     uint64
+	closed        bool
+	readErr       error
+	readerDone    chan struct{}
+	processDone   chan struct{}
+	lifecycleDone chan struct{}
+	closeOnce     sync.Once
+	closeDone     chan struct{}
+	closeErr      error
+}
+
+var (
+	ErrOperationCanceled = errors.New("operation canceled")
+	errSubscriberTooSlow = errors.New("subscriber too slow")
+)
+
+const maxRunStatusBytes = 32
+
+type runCollector struct {
+	marker    []byte
+	pending   []byte
+	status    []byte
+	output    []byte
+	limit     int
+	found     bool
+	complete  bool
+	truncated bool
+	exitCode  int
+}
+
+func newRunCollector(marker []byte, limit int) *runCollector {
+	return &runCollector{marker: marker, limit: limit}
+}
+
+func (c *runCollector) consume(data []byte) error {
+	if c.complete {
+		c.appendOutput(data)
+		return nil
+	}
+	if c.found {
+		return c.consumeStatus(data)
+	}
+
+	c.pending = append(c.pending, data...)
+	if markerStart := bytes.Index(c.pending, c.marker); markerStart >= 0 {
+		c.appendOutput(c.pending[:markerStart])
+		rest := append([]byte(nil), c.pending[markerStart+len(c.marker):]...)
+		c.pending = nil
+		c.found = true
+		return c.consumeStatus(rest)
+	}
+
+	keep := len(c.marker) - 1
+	if len(c.pending) > keep {
+		flush := len(c.pending) - keep
+		c.appendOutput(c.pending[:flush])
+		c.pending = append(c.pending[:0], c.pending[flush:]...)
+	}
+	return nil
+}
+
+func (c *runCollector) consumeStatus(data []byte) error {
+	c.status = append(c.status, data...)
+	lineEnd := bytes.IndexAny(c.status, "\r\n")
+	if lineEnd < 0 {
+		if len(c.status) > maxRunStatusBytes {
+			return errors.New("invalid command completion status")
+		}
+		return nil
+	}
+
+	exitCode, err := strconv.Atoi(strings.TrimSpace(string(c.status[:lineEnd])))
+	if err != nil {
+		return errors.New("invalid command completion status")
+	}
+	restStart := lineEnd + 1
+	if c.status[lineEnd] == '\r' && restStart < len(c.status) && c.status[restStart] == '\n' {
+		restStart++
+	}
+	c.exitCode = exitCode
+	c.complete = true
+	c.appendOutput(c.status[restStart:])
+	c.status = nil
+	return nil
+}
+
+func (c *runCollector) appendOutput(data []byte) {
+	if appendBounded(&c.output, data, c.limit) {
+		c.truncated = true
+	}
+}
+
+func appendBounded(output *[]byte, data []byte, limit int) bool {
+	remaining := limit - len(*output)
+	if remaining <= 0 {
+		return len(data) > 0
+	}
+	if len(data) > remaining {
+		*output = append(*output, data[:remaining]...)
+		return true
+	}
+	*output = append(*output, data...)
+	return false
+}
+
+func (c *runCollector) result(command, prefix string) RunResult {
+	complete := completeUTF8Prefix(c.output)
+	if complete < len(c.output) {
+		c.truncated = true
+	}
+	return RunResult{
+		Output:    formatRunOutput(c.output[:complete], command, prefix),
+		ExitCode:  c.exitCode,
+		Truncated: c.truncated,
+	}
 }
 
 type subscription struct {
-	id uint64
-	ch <-chan string
+	id   uint64
+	ch   <-chan string
+	done <-chan struct{}
+	err  <-chan error
 }
 
 type subscriber struct {
+	id       uint64
 	ch       chan string
 	done     chan struct{}
+	err      chan error
 	reliable bool
+	stopOnce sync.Once
+}
+
+func (s *subscriber) stop(err error) {
+	s.stopOnce.Do(func() {
+		if err != nil {
+			s.err <- err
+		}
+		close(s.done)
+	})
 }
 
 type skipPrefixWriter struct {
@@ -95,24 +222,48 @@ func NewPTYRunner(shell string) (*PTYRunner, error) {
 	}
 
 	r := &PTYRunner{
-		file:        file,
-		fd:          fd,
-		command:     cmd,
-		term:        vt10x.New(vt10x.WithSize(120, 40)),
-		subscribers: make(map[uint64]subscriber),
-		readerDone:  make(chan struct{}),
+		file:          file,
+		fd:            fd,
+		command:       cmd,
+		term:          vt10x.New(vt10x.WithSize(120, 40)),
+		subscribers:   make(map[uint64]*subscriber),
+		readerDone:    make(chan struct{}),
+		processDone:   make(chan struct{}),
+		lifecycleDone: make(chan struct{}),
+		closeDone:     make(chan struct{}),
 	}
+	go r.waitProcessLoop()
 	go r.readLoop()
+	go r.waitLifecycleLoop()
 	r.waitForInitialOutput(100 * time.Millisecond)
 	return r, nil
 }
 
 func (r *PTYRunner) Run(command string) (RunResult, error) {
+	return r.RunWithDone(command, nil)
+}
+
+func (r *PTYRunner) RunWithDone(command string, done <-chan struct{}) (RunResult, error) {
+	return r.runWithLimit(command, done, MaxRunOutputBytes)
+}
+
+func (r *PTYRunner) runWithLimit(command string, done <-chan struct{}, outputLimit int) (RunResult, error) {
 	r.commandMu.Lock()
 	defer r.commandMu.Unlock()
 
+	if done != nil {
+		select {
+		case <-done:
+			return RunResult{}, ErrOperationCanceled
+		default:
+		}
+	}
+
+	token, err := newCommandToken()
+	if err != nil {
+		return RunResult{}, err
+	}
 	prefix := r.currentLine()
-	token := fmt.Sprintf("__PTYMUX_DONE_%d_%d__", os.Getpid(), atomic.AddUint64(&r.seq, 1))
 	wrapped := wrapCommand(command, token)
 	sub := r.subscribeReliable()
 	defer r.unsubscribe(sub.id)
@@ -120,31 +271,45 @@ func (r *PTYRunner) Run(command string) (RunResult, error) {
 		return RunResult{}, err
 	}
 
-	var buf bytes.Buffer
-	marker := []byte(token + ":")
-	deadline := time.NewTimer(30 * time.Second)
-	defer deadline.Stop()
+	collector := newRunCollector([]byte(token+":"), outputLimit)
+	canceled := false
+	doneCh := done
 	for {
+		subscriberDone := sub.done
+		if len(sub.ch) > 0 {
+			subscriberDone = nil
+		}
 		select {
+		case <-doneCh:
+			interrupt := append([]byte{3}, []byte(wrapCompletion(token))...)
+			if _, err := r.file.Write(interrupt); err != nil {
+				return RunResult{}, err
+			}
+			canceled = true
+			doneCh = nil
+		case <-subscriberDone:
+			return RunResult{}, r.subscriptionResultErr(sub)
 		case chunk, ok := <-sub.ch:
 			if !ok {
-				return RunResult{}, r.subscriptionErr()
+				return RunResult{}, r.subscriptionResultErr(sub)
 			}
-			buf.WriteString(chunk)
-			if idx := bytes.Index(buf.Bytes(), marker); idx >= 0 {
-				_ = r.collectQuiet(sub.ch, &buf, 50*time.Millisecond)
-				result := parseMarkedOutput(buf.Bytes(), idx, len(marker), command, prefix)
-				r.record(result.Output)
+			if err := collector.consume([]byte(chunk)); err != nil {
+				return RunResult{}, err
+			}
+			if collector.complete {
+				_ = r.collectQuietOutput(sub, collector, 50*time.Millisecond)
+				result := collector.result(command, prefix)
+				if canceled {
+					return result, ErrOperationCanceled
+				}
 				return result, nil
 			}
-		case <-deadline.C:
-			return RunResult{}, os.ErrDeadlineExceeded
 		}
 	}
 }
 
 func (r *PTYRunner) RunIdle(command string) (RunResult, error) {
-	return r.runIdle(command, 500*time.Millisecond, 30*time.Second)
+	return r.runIdle(command, 500*time.Millisecond)
 }
 
 func (r *PTYRunner) Send(input string) error {
@@ -156,7 +321,7 @@ func (r *PTYRunner) Send(input string) error {
 }
 
 func (r *PTYRunner) SendWait(input string, quietFor time.Duration) (RunResult, error) {
-	return r.sendWait(input, quietFor, 30*time.Second, true)
+	return r.sendWait(input, quietFor, true)
 }
 
 func (r *PTYRunner) SendFollow(input string, output io.Writer, done <-chan struct{}) error {
@@ -185,7 +350,7 @@ func (r *PTYRunner) Command(keys string) error {
 }
 
 func (r *PTYRunner) CommandWait(keys string, quietFor time.Duration) (RunResult, error) {
-	return r.commandWait(keys, quietFor, 30*time.Second)
+	return r.commandWait(keys, quietFor)
 }
 
 func (r *PTYRunner) CommandFollow(keys string, output io.Writer, done <-chan struct{}) error {
@@ -206,7 +371,7 @@ func (r *PTYRunner) Keys(keys string) error {
 }
 
 func (r *PTYRunner) KeysWait(keys string, quietFor time.Duration) (RunResult, error) {
-	return r.keysWait(keys, quietFor, 30*time.Second)
+	return r.keysWait(keys, quietFor)
 }
 
 func (r *PTYRunner) KeysFollow(keys string, output io.Writer, done <-chan struct{}) error {
@@ -216,7 +381,7 @@ func (r *PTYRunner) KeysFollow(keys string, output io.Writer, done <-chan struct
 func (r *PTYRunner) Follow(output io.Writer, done <-chan struct{}) error {
 	sub := r.subscribeBestEffort()
 	defer r.unsubscribe(sub.id)
-	return r.writeSubscription(output, sub.ch, 0, done)
+	return r.writeRawSubscription(output, sub, done)
 }
 
 func (r *PTYRunner) CtrlCFollow(output io.Writer, done <-chan struct{}) error {
@@ -230,14 +395,16 @@ func (r *PTYRunner) Read(count int) (RunResult, error) {
 	if r.term == nil {
 		return RunResult{}, nil
 	}
-	screen := CleanTerminalString(strings.TrimRight(r.term.String(), "\n"))
 	if count > 0 {
-		return RunResult{Output: recentTerminalEntries(screen, count), ExitCode: 0}, nil
+		if r.term.Mode()&vt10x.ModeAltScreen != 0 {
+			return RunResult{Output: renderTerminalScreen(r.term, count), ExitCode: 0}, nil
+		}
+		return RunResult{Output: r.transcript.RecentLines(count), ExitCode: 0}, nil
 	}
-	return RunResult{Output: readableTerminalScreen(screen), ExitCode: 0}, nil
+	return RunResult{Output: renderTerminalScreen(r.term, 0), ExitCode: 0}, nil
 }
 
-func (r *PTYRunner) runIdle(command string, quietFor, maxWait time.Duration) (RunResult, error) {
+func (r *PTYRunner) runIdle(command string, quietFor time.Duration) (RunResult, error) {
 	r.commandMu.Lock()
 	defer r.commandMu.Unlock()
 
@@ -248,21 +415,16 @@ func (r *PTYRunner) runIdle(command string, quietFor, maxWait time.Duration) (Ru
 		return RunResult{}, err
 	}
 
-	output, timedOut, err := r.collectUntilQuiet(sub.ch, quietFor, maxWait)
+	output, truncated, err := r.collectUntilQuiet(sub, quietFor)
 	if err != nil {
 		return RunResult{}, err
 	}
 	output = cleanTerminalNoise(output)
 	output = formatCommandTranscript(trimOutputBoundary(output), command, prefix)
-	result := RunResult{Output: output, ExitCode: 0}
-	if timedOut {
-		result.ExitCode = 124
-	}
-	r.record(result.Output)
-	return result, nil
+	return RunResult{Output: output, ExitCode: 0, Truncated: truncated}, nil
 }
 
-func (r *PTYRunner) sendWait(input string, quietFor, maxWait time.Duration, returnOutput bool) (RunResult, error) {
+func (r *PTYRunner) sendWait(input string, quietFor time.Duration, returnOutput bool) (RunResult, error) {
 	r.commandMu.Lock()
 	defer r.commandMu.Unlock()
 
@@ -273,24 +435,20 @@ func (r *PTYRunner) sendWait(input string, quietFor, maxWait time.Duration, retu
 		return RunResult{}, err
 	}
 
-	output, timedOut, err := r.collectUntilQuiet(sub.ch, quietFor, maxWait)
+	output, truncated, err := r.collectUntilQuiet(sub, quietFor)
 	if err != nil {
 		return RunResult{}, err
 	}
 	output = cleanTerminalNoise(output)
 	output = formatCommandTranscript(trimOutputBoundary(output), input, prefix)
-	result := RunResult{Output: output, ExitCode: 0}
-	if timedOut {
-		result.ExitCode = 124
-	}
-	r.record(result.Output)
+	result := RunResult{Output: output, ExitCode: 0, Truncated: truncated}
 	if !returnOutput {
 		result.Output = ""
 	}
 	return result, nil
 }
 
-func (r *PTYRunner) commandWait(keys string, quietFor, maxWait time.Duration) (RunResult, error) {
+func (r *PTYRunner) commandWait(keys string, quietFor time.Duration) (RunResult, error) {
 	seq, err := parseKeySequence(keys)
 	if err != nil {
 		return RunResult{}, err
@@ -306,18 +464,13 @@ func (r *PTYRunner) commandWait(keys string, quietFor, maxWait time.Duration) (R
 		return RunResult{}, err
 	}
 
-	output, timedOut, err := r.collectUntilQuiet(sub.ch, quietFor, maxWait)
+	output, truncated, err := r.collectUntilQuiet(sub, quietFor)
 	if err != nil {
 		return RunResult{}, err
 	}
 	output = cleanTerminalNoise(output)
 	output = formatCommandTranscript(trimOutputBoundary(output), keys, prefix)
-	result := RunResult{Output: output, ExitCode: 0}
-	if timedOut {
-		result.ExitCode = 124
-	}
-	r.record(result.Output)
-	return result, nil
+	return RunResult{Output: output, ExitCode: 0, Truncated: truncated}, nil
 }
 
 func (r *PTYRunner) sendFollow(input string, output io.Writer, quietFor time.Duration, done <-chan struct{}) error {
@@ -335,16 +488,11 @@ func (r *PTYRunner) sendFollow(input string, output io.Writer, quietFor time.Dur
 
 	if prefix != "" {
 		if _, err := io.WriteString(output, prefix); err != nil {
-			return nil
+			return err
 		}
 	}
 
-	var observed bytes.Buffer
-	err := r.writeSubscription(io.MultiWriter(output, &observed), sub.ch, quietFor, done)
-	if observed.Len() > 0 {
-		r.record(prefix + strings.TrimRight(observed.String(), "\n"))
-	}
-	return err
+	return r.writeSubscription(output, sub, quietFor, done)
 }
 
 func (r *PTYRunner) commandFollow(keys string, output io.Writer, quietFor time.Duration, done <-chan struct{}) error {
@@ -364,15 +512,10 @@ func (r *PTYRunner) commandFollow(keys string, output io.Writer, quietFor time.D
 	r.commandMu.Unlock()
 	defer r.unsubscribe(sub.id)
 
-	var observed bytes.Buffer
-	err = r.writeSubscription(io.MultiWriter(output, &observed), sub.ch, quietFor, done)
-	if observed.Len() > 0 {
-		r.record(strings.TrimRight(observed.String(), "\n"))
-	}
-	return err
+	return r.writeSubscription(output, sub, quietFor, done)
 }
 
-func (r *PTYRunner) keysWait(keys string, quietFor, maxWait time.Duration) (RunResult, error) {
+func (r *PTYRunner) keysWait(keys string, quietFor time.Duration) (RunResult, error) {
 	seq, err := parseKeySequenceNoEnter(keys)
 	if err != nil {
 		return RunResult{}, err
@@ -387,18 +530,13 @@ func (r *PTYRunner) keysWait(keys string, quietFor, maxWait time.Duration) (RunR
 		return RunResult{}, err
 	}
 
-	output, timedOut, err := r.collectUntilQuiet(sub.ch, quietFor, maxWait)
+	output, truncated, err := r.collectUntilQuiet(sub, quietFor)
 	if err != nil {
 		return RunResult{}, err
 	}
 	output = cleanTerminalNoise(output)
 	output = trimOutputBoundary(output)
-	result := RunResult{Output: output, ExitCode: 0}
-	if timedOut {
-		result.ExitCode = 124
-	}
-	r.record(result.Output)
-	return result, nil
+	return RunResult{Output: output, ExitCode: 0, Truncated: truncated}, nil
 }
 
 func (r *PTYRunner) keysFollow(keys string, output io.Writer, quietFor time.Duration, done <-chan struct{}) error {
@@ -418,12 +556,7 @@ func (r *PTYRunner) keysFollow(keys string, output io.Writer, quietFor time.Dura
 	r.commandMu.Unlock()
 	defer r.unsubscribe(sub.id)
 
-	var observed bytes.Buffer
-	err = r.writeSubscription(io.MultiWriter(output, &observed), sub.ch, quietFor, done)
-	if observed.Len() > 0 {
-		r.record(strings.TrimRight(observed.String(), "\n"))
-	}
-	return err
+	return r.writeSubscription(output, sub, quietFor, done)
 }
 
 func (r *PTYRunner) ctrlCFollow(output io.Writer, quietFor time.Duration, done <-chan struct{}) error {
@@ -438,34 +571,15 @@ func (r *PTYRunner) ctrlCFollow(output io.Writer, quietFor time.Duration, done <
 	if _, err := io.WriteString(output, "^C"); err != nil {
 		r.unsubscribe(sub.id)
 		r.commandMu.Unlock()
-		return nil
+		return err
 	}
 	r.commandMu.Unlock()
 	defer r.unsubscribe(sub.id)
 
-	var observed bytes.Buffer
-	err := r.writeSubscription(&skipPrefixWriter{
-		w:      io.MultiWriter(output, &observed),
+	return r.writeSubscription(&skipPrefixWriter{
+		w:      output,
 		prefix: "^C",
-	}, sub.ch, quietFor, done)
-	if observed.Len() > 0 {
-		r.record(strings.TrimRight(observed.String(), "\n"))
-	}
-	return err
-}
-
-func (r *PTYRunner) record(output string) {
-	output = strings.Trim(output, "\n")
-	if output == "" {
-		return
-	}
-	r.stateMu.Lock()
-	defer r.stateMu.Unlock()
-	r.history = append(r.history, output)
-	const maxHistory = 200
-	if len(r.history) > maxHistory {
-		r.history = r.history[len(r.history)-maxHistory:]
-	}
+	}, sub, quietFor, done)
 }
 
 func (r *PTYRunner) readLoop() {
@@ -513,39 +627,49 @@ func (r *PTYRunner) subscribeReliable() subscription {
 }
 
 func (r *PTYRunner) subscribe(reliable bool) subscription {
-	ch := make(chan string, 128)
-	done := make(chan struct{})
+	sub := &subscriber{
+		ch:       make(chan string, 128),
+		done:     make(chan struct{}),
+		err:      make(chan error, 1),
+		reliable: reliable,
+	}
 
 	r.stateMu.Lock()
-	defer r.stateMu.Unlock()
 	if r.closed {
-		close(ch)
-		return subscription{ch: ch}
+		err := r.readErr
+		if err == nil {
+			err = io.EOF
+		}
+		r.stateMu.Unlock()
+		sub.stop(err)
+		return subscription{ch: sub.ch, done: sub.done, err: sub.err}
 	}
-	id := r.nextSubID
+	sub.id = r.nextSubID
 	r.nextSubID++
-	r.subscribers[id] = subscriber{ch: ch, done: done, reliable: reliable}
-	return subscription{id: id, ch: ch}
+	r.subscribers[sub.id] = sub
+	r.stateMu.Unlock()
+	return subscription{id: sub.id, ch: sub.ch, done: sub.done, err: sub.err}
 }
 
 func (r *PTYRunner) unsubscribe(id uint64) {
 	r.stateMu.Lock()
-	defer r.stateMu.Unlock()
-	if sub, ok := r.subscribers[id]; ok {
-		delete(r.subscribers, id)
-		close(sub.done)
+	sub := r.subscribers[id]
+	delete(r.subscribers, id)
+	r.stateMu.Unlock()
+	if sub != nil {
+		sub.stop(nil)
 	}
 }
 
 func (r *PTYRunner) broadcast(chunk string) {
 	r.stateMu.Lock()
-	subs := make([]subscriber, 0, len(r.subscribers))
+	subscribers := make([]*subscriber, 0, len(r.subscribers))
 	for _, sub := range r.subscribers {
-		subs = append(subs, sub)
+		subscribers = append(subscribers, sub)
 	}
 	r.stateMu.Unlock()
 
-	for _, sub := range subs {
+	for _, sub := range subscribers {
 		if sub.reliable {
 			select {
 			case sub.ch <- chunk:
@@ -557,22 +681,35 @@ func (r *PTYRunner) broadcast(chunk string) {
 		case sub.ch <- chunk:
 		case <-sub.done:
 		default:
+			sub.stop(errSubscriberTooSlow)
+			r.stateMu.Lock()
+			if r.subscribers[sub.id] == sub {
+				delete(r.subscribers, sub.id)
+			}
+			r.stateMu.Unlock()
 		}
 	}
 }
 
 func (r *PTYRunner) closeSubscribers(err error) {
 	r.stateMu.Lock()
-	defer r.stateMu.Unlock()
 	if r.closed {
+		r.stateMu.Unlock()
 		return
 	}
 	r.closed = true
 	r.readErr = err
+	if err == nil {
+		err = io.EOF
+	}
+	subscribers := make([]*subscriber, 0, len(r.subscribers))
 	for id, sub := range r.subscribers {
-		close(sub.ch)
-		close(sub.done)
+		subscribers = append(subscribers, sub)
 		delete(r.subscribers, id)
+	}
+	r.stateMu.Unlock()
+	for _, sub := range subscribers {
+		sub.stop(err)
 	}
 }
 
@@ -594,7 +731,44 @@ func (r *PTYRunner) subscriptionErr() error {
 	return nil
 }
 
-func (r *PTYRunner) writeSubscription(output io.Writer, ch <-chan string, quietFor time.Duration, done <-chan struct{}) error {
+func (r *PTYRunner) subscriptionResultErr(sub subscription) error {
+	select {
+	case err, ok := <-sub.err:
+		if ok && err != nil {
+			return err
+		}
+	default:
+	}
+	return r.subscriptionErr()
+}
+
+func (r *PTYRunner) writeRawSubscription(output io.Writer, sub subscription, done <-chan struct{}) error {
+	var doneCh <-chan struct{}
+	if done != nil {
+		doneCh = done
+	}
+	for {
+		subscriberDone := sub.done
+		if len(sub.ch) > 0 {
+			subscriberDone = nil
+		}
+		select {
+		case <-doneCh:
+			return nil
+		case <-subscriberDone:
+			return r.subscriptionResultErr(sub)
+		case chunk, ok := <-sub.ch:
+			if !ok {
+				return r.subscriptionResultErr(sub)
+			}
+			if _, err := io.WriteString(output, chunk); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func (r *PTYRunner) writeSubscription(output io.Writer, sub subscription, quietFor time.Duration, done <-chan struct{}) error {
 	var doneCh <-chan struct{}
 	if done != nil {
 		doneCh = done
@@ -615,10 +789,12 @@ func (r *PTYRunner) writeSubscription(output io.Writer, ch <-chan string, quietF
 	defer flushTimer.Stop()
 	var flush <-chan time.Time
 	const streamFlushInterval = 100 * time.Millisecond
-	flushNow := func() {
+	flushNow := func() error {
 		if flushed := cleaner.Flush(); flushed != "" {
-			_, _ = io.WriteString(output, flushed)
+			_, err := io.WriteString(output, flushed)
+			return err
 		}
+		return nil
 	}
 	scheduleFlush := func() {
 		if !cleaner.Pending() {
@@ -642,24 +818,35 @@ func (r *PTYRunner) writeSubscription(output io.Writer, ch <-chan string, quietF
 	}
 
 	for {
+		subscriberDone := sub.done
+		if len(sub.ch) > 0 {
+			subscriberDone = nil
+		}
 		select {
 		case <-doneCh:
-			flushNow()
-			return nil
+			return flushNow()
 		case <-quiet:
-			flushNow()
-			return nil
+			return flushNow()
 		case <-flush:
-			flushNow()
+			if err := flushNow(); err != nil {
+				return err
+			}
 			flush = nil
-		case chunk, ok := <-ch:
+		case <-subscriberDone:
+			if err := flushNow(); err != nil {
+				return err
+			}
+			return r.subscriptionResultErr(sub)
+		case chunk, ok := <-sub.ch:
 			if !ok {
-				flushNow()
-				return r.subscriptionErr()
+				if err := flushNow(); err != nil {
+					return err
+				}
+				return r.subscriptionResultErr(sub)
 			}
 			cleaned := cleaner.WriteString(chunk)
 			if _, err := io.WriteString(output, cleaned); err != nil {
-				return nil
+				return err
 			}
 			scheduleFlush()
 			if timer != nil {
@@ -675,57 +862,61 @@ func (r *PTYRunner) writeSubscription(output io.Writer, ch <-chan string, quietF
 	}
 }
 
-func (r *PTYRunner) collectUntilQuiet(ch <-chan string, quietFor, maxWait time.Duration) (string, bool, error) {
-	var buf bytes.Buffer
-	deadline := time.NewTimer(maxWait)
-	defer deadline.Stop()
-
-	var quiet <-chan time.Time
-	var timer *time.Timer
-	defer func() {
-		if timer != nil {
-			timer.Stop()
-		}
-	}()
-
-	for {
-		select {
-		case chunk, ok := <-ch:
-			if !ok {
-				return "", false, r.subscriptionErr()
-			}
-			buf.WriteString(chunk)
-			if timer == nil {
-				timer = time.NewTimer(quietFor)
-				quiet = timer.C
-			} else {
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
-				timer.Reset(quietFor)
-			}
-		case <-quiet:
-			return buf.String(), false, nil
-		case <-deadline.C:
-			return buf.String(), true, nil
-		}
-	}
-}
-
-func (r *PTYRunner) collectQuiet(ch <-chan string, buf *bytes.Buffer, quietFor time.Duration) error {
+func (r *PTYRunner) collectUntilQuiet(sub subscription, quietFor time.Duration) (string, bool, error) {
+	var output []byte
+	truncated := false
 	timer := time.NewTimer(quietFor)
 	defer timer.Stop()
 
 	for {
+		subscriberDone := sub.done
+		if len(sub.ch) > 0 {
+			subscriberDone = nil
+		}
 		select {
-		case chunk, ok := <-ch:
+		case <-subscriberDone:
+			return "", false, r.subscriptionResultErr(sub)
+		case chunk, ok := <-sub.ch:
 			if !ok {
-				return r.subscriptionErr()
+				return "", false, r.subscriptionResultErr(sub)
 			}
-			buf.WriteString(chunk)
+			if appendBounded(&output, []byte(chunk), MaxRunOutputBytes) {
+				truncated = true
+			}
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(quietFor)
+		case <-timer.C:
+			complete := completeUTF8Prefix(output)
+			if complete < len(output) {
+				truncated = true
+			}
+			return string(output[:complete]), truncated, nil
+		}
+	}
+}
+
+func (r *PTYRunner) collectQuietOutput(sub subscription, collector *runCollector, quietFor time.Duration) error {
+	timer := time.NewTimer(quietFor)
+	defer timer.Stop()
+
+	for {
+		subscriberDone := sub.done
+		if len(sub.ch) > 0 {
+			subscriberDone = nil
+		}
+		select {
+		case <-subscriberDone:
+			return r.subscriptionResultErr(sub)
+		case chunk, ok := <-sub.ch:
+			if !ok {
+				return r.subscriptionResultErr(sub)
+			}
+			collector.appendOutput([]byte(chunk))
 			if !timer.Stop() {
 				select {
 				case <-timer.C:
@@ -747,98 +938,6 @@ func trimOutputBoundary(output string) string {
 	return output
 }
 
-func recentTerminalEntries(screen string, count int) string {
-	if count <= 0 {
-		return strings.TrimRight(screen, "\n")
-	}
-	lines := normalizeScreenLines(screen)
-	var entries [][]string
-	var current []string
-	for _, line := range lines {
-		if isPromptCommandLine(line) {
-			if len(current) > 0 {
-				entries = append(entries, current)
-			}
-			current = []string{line}
-			continue
-		}
-		if len(current) > 0 {
-			current = append(current, line)
-		}
-	}
-	if len(current) > 0 {
-		entries = append(entries, current)
-	}
-	if len(entries) == 0 {
-		return ""
-	}
-	start := len(entries) - count
-	if start < 0 {
-		start = 0
-	}
-	out := make([]string, 0, len(entries)-start)
-	for _, entry := range entries[start:] {
-		out = append(out, strings.Join(compactTerminalEntry(entry), "\n"))
-	}
-	return strings.Join(out, "\n")
-}
-
-func readableTerminalScreen(screen string) string {
-	return strings.Join(normalizeScreenLines(screen), "\n")
-}
-
-func compactTerminalEntry(lines []string) []string {
-	lines = trimTrailingBlankLines(lines)
-	out := make([]string, 0, len(lines))
-	for i, line := range lines {
-		if strings.TrimSpace(line) == "" && i+1 < len(lines) && isPromptLike(lines[i+1]) {
-			continue
-		}
-		out = append(out, line)
-	}
-	return out
-}
-
-func normalizeScreenLines(screen string) []string {
-	raw := strings.Split(screen, "\n")
-	lines := make([]string, 0, len(raw))
-	for _, line := range raw {
-		line = strings.TrimRight(line, " \t\r")
-		if isInternalMarkerLine(line) {
-			continue
-		}
-		lines = append(lines, line)
-	}
-	return trimTrailingBlankLines(lines)
-}
-
-func trimTrailingBlankLines(lines []string) []string {
-	end := len(lines)
-	for end > 0 && strings.TrimSpace(lines[end-1]) == "" {
-		end--
-	}
-	return lines[:end]
-}
-
-func isPromptCommandLine(line string) bool {
-	line = strings.TrimRight(line, " \t")
-	for _, marker := range []string{"$", "#", ">", "%"} {
-		idx := strings.LastIndex(line, marker)
-		if idx < 0 || idx == len(line)-1 {
-			continue
-		}
-		after := line[idx+1:]
-		if strings.TrimSpace(after) == "" {
-			continue
-		}
-		if strings.HasPrefix(after, " ") {
-			return strings.TrimSpace(after) != ""
-		}
-		return true
-	}
-	return false
-}
-
 func isInternalMarkerLine(line string) bool {
 	return strings.Contains(line, "__ptymux_status=$?") ||
 		strings.Contains(line, "__ptymux_token_a=") ||
@@ -849,48 +948,67 @@ func isInternalMarkerLine(line string) bool {
 		strings.Contains(line, "__PTYMUX_DONE_")
 }
 
+func newCommandToken() (string, error) {
+	var random [16]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return "", err
+	}
+	return "__PTYMUX_DONE_" + hex.EncodeToString(random[:]) + "__", nil
+}
+
 func wrapCommand(command, token string) string {
+	return command + "\n" + wrapCompletion(token)
+}
+
+func wrapCompletion(token string) string {
 	tokenA := token[:len(token)/2]
 	tokenB := token[len(token)/2:]
-	return fmt.Sprintf("%s\n__ptymux_status=$?; __ptymux_token_a=%q; __ptymux_token_b=%q; printf '\\n%%s%%s:%%s\\n' \"$__ptymux_token_a\" \"$__ptymux_token_b\" \"$__ptymux_status\"\n", command, tokenA, tokenB)
+	return fmt.Sprintf("__ptymux_status=$?; __ptymux_token_a=%q; __ptymux_token_b=%q; printf '\\n%%s%%s:%%s\\n' \"$__ptymux_token_a\" \"$__ptymux_token_b\" \"$__ptymux_status\"\n", tokenA, tokenB)
 }
 
 func (r *PTYRunner) Close() error {
-	var firstErr error
-	if r.command != nil && r.command.Process != nil {
-		if err := signalProcessGroup(r.command.Process.Pid, syscall.SIGTERM); err != nil && firstErr == nil {
-			firstErr = err
+	r.closeOnce.Do(func() {
+		defer close(r.closeDone)
+
+		if r.command != nil && r.command.Process != nil {
+			if err := signalProcessGroup(r.command.Process.Pid, syscall.SIGTERM); err != nil && r.closeErr == nil {
+				r.closeErr = err
+			}
 		}
-	}
-	waitDone := r.waitProcess()
-	if !waitWithTimeout(waitDone, 500*time.Millisecond) {
+		if !waitWithTimeout(r.processDone, 500*time.Millisecond) {
+			if r.command != nil && r.command.Process != nil {
+				if err := signalProcessGroup(r.command.Process.Pid, syscall.SIGKILL); err != nil && r.closeErr == nil {
+					r.closeErr = err
+				}
+			}
+			waitWithTimeout(r.processDone, time.Second)
+		}
 		if r.file != nil {
 			_ = r.file.Close()
 		}
-		if r.command != nil && r.command.Process != nil {
-			if err := signalProcessGroup(r.command.Process.Pid, syscall.SIGKILL); err != nil && firstErr == nil {
-				firstErr = err
-			}
+		if r.readerDone != nil {
+			<-r.readerDone
 		}
-		waitWithTimeout(waitDone, time.Second)
-	} else if r.file != nil {
-		_ = r.file.Close()
-	}
-	if r.readerDone != nil {
-		<-r.readerDone
-	}
-	return firstErr
+	})
+	<-r.closeDone
+	return r.closeErr
 }
 
-func (r *PTYRunner) waitProcess() <-chan struct{} {
-	done := make(chan struct{})
-	go func() {
-		if r.command != nil && r.command.Process != nil {
-			_, _ = r.command.Process.Wait()
-		}
-		close(done)
-	}()
-	return done
+func (r *PTYRunner) Done() <-chan struct{} {
+	return r.lifecycleDone
+}
+
+func (r *PTYRunner) waitProcessLoop() {
+	if r.command != nil {
+		_ = r.command.Wait()
+	}
+	close(r.processDone)
+}
+
+func (r *PTYRunner) waitLifecycleLoop() {
+	<-r.processDone
+	<-r.readerDone
+	close(r.lifecycleDone)
 }
 
 func waitWithTimeout(done <-chan struct{}, timeout time.Duration) bool {
@@ -922,11 +1040,29 @@ func isRetryableRead(err error) bool {
 	return errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, os.ErrDeadlineExceeded)
 }
 
+func completeUTF8Prefix(data []byte) int {
+	for offset := 0; offset < len(data); {
+		_, size := utf8.DecodeRune(data[offset:])
+		if size == 1 && !utf8.FullRune(data[offset:]) {
+			return offset
+		}
+		offset += size
+	}
+	return len(data)
+}
+
 func (r *PTYRunner) observe(data []byte) string {
 	r.stateMu.Lock()
 	defer r.stateMu.Unlock()
 	if r.term != nil {
-		_, _ = r.term.Write(data)
+		terminalData := data
+		if len(r.terminalPending) > 0 {
+			terminalData = append(append([]byte(nil), r.terminalPending...), data...)
+		}
+		complete := completeUTF8Prefix(terminalData)
+		written, _ := r.term.Write(terminalData[:complete])
+		r.terminalPending = append(r.terminalPending[:0], terminalData[written:]...)
+		r.transcript.Write(data)
 	}
 	return string(data)
 }
@@ -970,15 +1106,17 @@ func parseMarkedOutput(raw []byte, markerStart, markerLen int, command, prefix s
 	if strings.Trim(afterStatus, "\r\n") != "" {
 		output += "\n" + strings.TrimLeft(afterStatus, "\r\n")
 	}
-	output = strings.ReplaceAll(output, "\r\n", "\n")
+	return RunResult{Output: formatRunOutput([]byte(output), command, prefix), ExitCode: exitCode}
+}
+
+func formatRunOutput(raw []byte, command, prefix string) string {
+	output := strings.ReplaceAll(string(raw), "\r\n", "\n")
 	output = cleanTerminalNoise(output)
 	lines := strings.Split(output, "\n")
 	lines = dropEchoLines(lines)
 	output = strings.Join(lines, "\n")
 	output = strings.Trim(output, "\n")
-	output = formatCommandTranscript(output, command, prefix)
-
-	return RunResult{Output: output, ExitCode: exitCode}
+	return formatCommandTranscript(output, command, prefix)
 }
 
 func dropEchoLines(lines []string) []string {

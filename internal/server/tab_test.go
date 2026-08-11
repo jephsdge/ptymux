@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"errors"
 	"strings"
 	"sync"
 	"syscall"
@@ -10,6 +11,14 @@ import (
 
 	"github.com/hinshun/vt10x"
 )
+
+type failingWriter struct {
+	err error
+}
+
+func (w failingWriter) Write([]byte) (int, error) {
+	return 0, w.err
+}
 
 type safeBuffer struct {
 	mu  sync.Mutex
@@ -142,6 +151,50 @@ func TestParseMarkedOutputCleansTerminalControls(t *testing.T) {
 	}
 }
 
+func TestRunCollectorDetectsSplitMarkerAfterOutputLimit(t *testing.T) {
+	marker := []byte("__PTYMUX_DONE_RANDOM__:")
+	collector := newRunCollector(marker, 4)
+	for _, chunk := range [][]byte{
+		[]byte("abcdef__PTYMUX_DONE_"),
+		[]byte("RANDOM__:7\r"),
+		[]byte("\nprompt$ "),
+	} {
+		if err := collector.consume(chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !collector.complete {
+		t.Fatal("collector did not find completion marker")
+	}
+	result := collector.result("command", "")
+	if result.ExitCode != 7 {
+		t.Fatalf("ExitCode = %d, want 7", result.ExitCode)
+	}
+	if !result.Truncated {
+		t.Fatal("Truncated = false, want true")
+	}
+	if len(result.Output) > 4 {
+		t.Fatalf("output length = %d, want at most 4", len(result.Output))
+	}
+}
+
+func TestNewCommandTokenIsRandom(t *testing.T) {
+	first, err := newCommandToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := newCommandToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatalf("generated duplicate command token %q", first)
+	}
+	if !strings.HasPrefix(first, "__PTYMUX_DONE_") || !strings.HasSuffix(first, "__") {
+		t.Fatalf("token = %q, want ptymux marker form", first)
+	}
+}
+
 func TestCurrentLineReadsTerminalScreenState(t *testing.T) {
 	runner := &PTYRunner{term: vt10x.New(vt10x.WithSize(40, 10))}
 	runner.observe([]byte("sh-5.3$ "))
@@ -219,6 +272,147 @@ func TestPTYRunnerRunDoesNotDropMarkerAfterHighOutput(t *testing.T) {
 	}
 }
 
+func TestPTYRunnerRunCancellationInterruptsCommandAndPreservesShell(t *testing.T) {
+	runner, err := NewPTYRunner("/bin/sh")
+	if err != nil {
+		t.Fatalf("NewPTYRunner returned error: %v", err)
+	}
+	defer runner.Close()
+
+	clientDone := make(chan struct{})
+	runDone := make(chan error, 1)
+	go func() {
+		_, err := runner.RunWithDone("sleep 10", clientDone)
+		runDone <- err
+	}()
+	waitForSubscriberCount(t, runner, 1)
+	time.Sleep(100 * time.Millisecond)
+	close(clientDone)
+
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, ErrOperationCanceled) {
+			t.Fatalf("RunWithDone error = %v, want %v", err, ErrOperationCanceled)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("RunWithDone did not return after cancellation")
+	}
+
+	result, err := runner.Run("printf recovered")
+	if err != nil {
+		t.Fatalf("Run after cancellation returned error: %v", err)
+	}
+	if !strings.Contains(result.Output, "recovered") {
+		t.Fatalf("Output = %q, want recovered shell output", result.Output)
+	}
+}
+
+func TestPTYRunnerRunOutputLimitPreservesExitStatusAndNextCommand(t *testing.T) {
+	runner, err := NewPTYRunner("/bin/sh")
+	if err != nil {
+		t.Fatalf("NewPTYRunner returned error: %v", err)
+	}
+	defer runner.Close()
+
+	result, err := runner.runWithLimit("sh -c 'printf abcdefghij; exit 7'", nil, 4)
+	if err != nil {
+		t.Fatalf("runWithLimit returned error: %v", err)
+	}
+	if result.ExitCode != 7 {
+		t.Fatalf("ExitCode = %d, want 7", result.ExitCode)
+	}
+	if !result.Truncated {
+		t.Fatal("Truncated = false, want true")
+	}
+
+	next, err := runner.Run("printf synchronized")
+	if err != nil {
+		t.Fatalf("Run after truncated command returned error: %v", err)
+	}
+	if !strings.Contains(next.Output, "synchronized") {
+		t.Fatalf("Output = %q, want synchronized", next.Output)
+	}
+}
+
+func TestCollectUntilQuietStartsTimerBeforeOutput(t *testing.T) {
+	runner := &PTYRunner{}
+	sub := subscription{
+		ch:   make(chan string),
+		done: make(chan struct{}),
+		err:  make(chan error, 1),
+	}
+	started := time.Now()
+	output, truncated, err := runner.collectUntilQuiet(sub, 40*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output != "" || truncated {
+		t.Fatalf("output = %q, truncated = %v; want empty, false", output, truncated)
+	}
+	if elapsed := time.Since(started); elapsed < 30*time.Millisecond || elapsed > time.Second {
+		t.Fatalf("elapsed = %v, want quiet timer duration", elapsed)
+	}
+}
+
+func TestCollectUntilQuietResetsTimerForEachChunk(t *testing.T) {
+	runner := &PTYRunner{}
+	chunks := make(chan string, 3)
+	sub := subscription{
+		ch:   chunks,
+		done: make(chan struct{}),
+		err:  make(chan error, 1),
+	}
+	type result struct {
+		output    string
+		truncated bool
+		err       error
+	}
+	resultCh := make(chan result, 1)
+	started := time.Now()
+	go func() {
+		output, truncated, err := runner.collectUntilQuiet(sub, 60*time.Millisecond)
+		resultCh <- result{output: output, truncated: truncated, err: err}
+	}()
+	chunks <- "one"
+	time.Sleep(40 * time.Millisecond)
+	chunks <- "two"
+	time.Sleep(40 * time.Millisecond)
+	chunks <- "three"
+
+	got := <-resultCh
+	if got.err != nil {
+		t.Fatal(got.err)
+	}
+	if got.output != "onetwothree" || got.truncated {
+		t.Fatalf("output = %q, truncated = %v; want onetwothree, false", got.output, got.truncated)
+	}
+	if elapsed := time.Since(started); elapsed < 120*time.Millisecond {
+		t.Fatalf("elapsed = %v, timer was not reset by output", elapsed)
+	}
+}
+
+func TestCollectUntilQuietBoundsCapturedOutput(t *testing.T) {
+	runner := &PTYRunner{}
+	chunks := make(chan string, 1)
+	chunks <- string(bytes.Repeat([]byte("x"), MaxRunOutputBytes+1))
+	sub := subscription{
+		ch:   chunks,
+		done: make(chan struct{}),
+		err:  make(chan error, 1),
+	}
+
+	output, truncated, err := runner.collectUntilQuiet(sub, 10*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !truncated {
+		t.Fatal("truncated = false, want true")
+	}
+	if len(output) != MaxRunOutputBytes {
+		t.Fatalf("output length = %d, want %d", len(output), MaxRunOutputBytes)
+	}
+}
+
 func TestPTYRunnerIdleReturnsAfterOutputQuiets(t *testing.T) {
 	runner, err := NewPTYRunner("/bin/sh")
 	if err != nil {
@@ -226,7 +420,7 @@ func TestPTYRunnerIdleReturnsAfterOutputQuiets(t *testing.T) {
 	}
 	defer runner.Close()
 
-	result, err := runner.runIdle("printf idle-output", 50*time.Millisecond, time.Second)
+	result, err := runner.runIdle("printf idle-output", 50*time.Millisecond)
 	if err != nil {
 		t.Fatalf("runIdle returned error: %v", err)
 	}
@@ -278,68 +472,83 @@ func TestPTYRunnerSendWaitReturnsAfterQuiet(t *testing.T) {
 	}
 }
 
-func TestPTYRunnerReadRecentEntriesFromTerminalScreenWindow(t *testing.T) {
+func TestPTYRunnerReadRecentTerminalLines(t *testing.T) {
 	runner := &PTYRunner{term: vt10x.New(vt10x.WithSize(80, 10))}
-	runner.observe([]byte("sh-5.3$ one\r\n1\r\nsh-5.3$ two\r\n2\r\nsh-5.3$ three\r\n3\r\nsh-5.3$ "))
+	runner.observe([]byte("one\r\narrow -> text\r\nthree"))
 
 	result, err := runner.Read(2)
 	if err != nil {
 		t.Fatalf("Read returned error: %v", err)
 	}
 
-	want := "sh-5.3$ two\n2\nsh-5.3$ three\n3\nsh-5.3$"
+	want := "arrow -> text\nthree"
 	if result.Output != want {
 		t.Fatalf("Output = %q, want %q", result.Output, want)
 	}
 }
 
-func TestPTYRunnerReadRecentEntriesFromTerminalScreen(t *testing.T) {
-	runner := &PTYRunner{
-		term:    vt10x.New(vt10x.WithSize(80, 10)),
-		history: []string{"history-only"},
-	}
-	runner.observe([]byte("sh-5.3$ echo old\r\nold\r\nsh-5.3$ pwd\r\n/home/work\r\nsh-5.3$ "))
+func TestPTYRunnerReadRecentLinesPreservesANSI(t *testing.T) {
+	runner := &PTYRunner{term: vt10x.New(vt10x.WithSize(80, 10))}
+	runner.observe([]byte("\x1b[31mred\x1b[0m\r\nplain"))
 
-	result, err := runner.Read(1)
+	result, err := runner.Read(2)
 	if err != nil {
 		t.Fatalf("Read returned error: %v", err)
 	}
-
-	want := "sh-5.3$ pwd\n/home/work\nsh-5.3$"
-	if result.Output != want {
-		t.Fatalf("Output = %q, want %q", result.Output, want)
+	if !strings.Contains(result.Output, "\x1b[31mred\x1b[0m") || !strings.HasSuffix(result.Output, "plain") {
+		t.Fatalf("Output did not preserve ANSI history: %q", result.Output)
 	}
 }
 
-func TestPTYRunnerReadRecentEntriesHidesInternalMarkerLines(t *testing.T) {
-	runner := &PTYRunner{term: vt10x.New(vt10x.WithSize(120, 10))}
-	runner.observe([]byte("sh-5.3$ pwd\r\n/home/work\r\nsh-5.3$ __ptymux_status=$?; __ptymux_token_a=\"__PTYMUX_DON\"; __ptymux_token_b=\"E_TEST__\"; printf '\\n%s%s:%s\\n' \"$__ptymux_token_a\" \"$__ptymux_token_b\" \"$__ptymux_status\"\r\n\r\n__PTYMUX_DONE_TEST__:0\r\nsh-5.3$ "))
-
-	result, err := runner.Read(5)
-	if err != nil {
-		t.Fatalf("Read returned error: %v", err)
-	}
-
-	want := "sh-5.3$ pwd\n/home/work\nsh-5.3$"
-	if result.Output != want {
-		t.Fatalf("Output = %q, want %q", result.Output, want)
-	}
-}
-
-func TestPTYRunnerReadScreenHidesInternalMarkerLines(t *testing.T) {
-	runner := &PTYRunner{term: vt10x.New(vt10x.WithSize(120, 10))}
-	runner.observe([]byte("sh-5.3$ pwd\r\n/home/work\r\nsh-5.3$ __ptymux_status=$?; __ptymux_token_a=\"__PTYMUX_DON\"; __ptymux_token_b=\"E_TEST__\"; printf '\\n%s%s:%s\\n' \"$__ptymux_token_a\" \"$__ptymux_token_b\" \"$__ptymux_status\"\r\n\r\n__PTYMUX_DONE_TEST__:0\r\nsh-5.3$ "))
+func TestPTYRunnerReadCurrentScreenPreservesStyledSpaces(t *testing.T) {
+	runner := &PTYRunner{term: vt10x.New(vt10x.WithSize(20, 4))}
+	runner.observe([]byte("\x1b[41m  \x1b[0mQR"))
 
 	result, err := runner.Read(0)
 	if err != nil {
 		t.Fatalf("Read returned error: %v", err)
 	}
-
-	if strings.Contains(result.Output, "__ptymux_") || strings.Contains(result.Output, "__PTYMUX_DONE_") {
-		t.Fatalf("Output leaked marker internals: %q", result.Output)
+	if !strings.Contains(result.Output, "\x1b[48;5;1m  \x1b[0mQR") {
+		t.Fatalf("Output did not preserve background-colored spaces: %q", result.Output)
 	}
-	if !strings.Contains(result.Output, "sh-5.3$ pwd") || !strings.Contains(result.Output, "/home/work") {
-		t.Fatalf("Output = %q, want visible command output", result.Output)
+}
+
+func TestPTYRunnerReadHistorySurvivesScreenClear(t *testing.T) {
+	runner := &PTYRunner{term: vt10x.New(vt10x.WithSize(40, 5))}
+	runner.observe([]byte("old-one\r\nold-two\r\n\x1b[2J\x1b[Hcurrent"))
+
+	current, err := runner.Read(0)
+	if err != nil {
+		t.Fatalf("Read current returned error: %v", err)
+	}
+	if strings.Contains(current.Output, "old-one") || current.Output != "current" {
+		t.Fatalf("Current screen = %q, want current only", current.Output)
+	}
+
+	history, err := runner.Read(3)
+	if err != nil {
+		t.Fatalf("Read history returned error: %v", err)
+	}
+	if history.Output != "old-one\nold-two\ncurrent" {
+		t.Fatalf("History = %q", history.Output)
+	}
+}
+
+func TestPTYRunnerReadHidesInternalMarkerLines(t *testing.T) {
+	runner := &PTYRunner{term: vt10x.New(vt10x.WithSize(120, 10))}
+	runner.observe([]byte("visible\r\n\x1b[31m__PTYMUX_DONE_TEST__:0\x1b[0m\r\nsh-5.3$ "))
+
+	for _, count := range []int{0, 5} {
+		result, err := runner.Read(count)
+		if err != nil {
+			t.Fatalf("Read(%d) returned error: %v", count, err)
+		}
+		if strings.Contains(result.Output, "__PTYMUX_DONE_") {
+			t.Fatalf("Read(%d) leaked marker internals: %q", count, result.Output)
+		}
+		if !strings.Contains(result.Output, "visible") || !strings.Contains(result.Output, "sh-5.3$") {
+			t.Fatalf("Read(%d) = %q, want visible output", count, result.Output)
+		}
 	}
 }
 
@@ -358,6 +567,19 @@ func TestPTYRunnerSendFollowStreamsOutputUntilQuietForTest(t *testing.T) {
 	got := out.String()
 	if !strings.Contains(got, "follow-output") {
 		t.Fatalf("streamed output = %q, want it to contain follow-output", got)
+	}
+}
+
+func TestPTYRunnerSendFollowPropagatesWriterError(t *testing.T) {
+	runner, err := NewPTYRunner("/bin/sh")
+	if err != nil {
+		t.Fatalf("NewPTYRunner returned error: %v", err)
+	}
+	defer runner.Close()
+
+	writeErr := errors.New("output failed")
+	if err := runner.sendFollow("printf follow-output", failingWriter{err: writeErr}, 100*time.Millisecond, nil); !errors.Is(err, writeErr) {
+		t.Fatalf("sendFollow error = %v, want %v", err, writeErr)
 	}
 }
 
@@ -468,6 +690,53 @@ func TestPTYRunnerMultipleFollowersReceiveOutput(t *testing.T) {
 	}
 }
 
+func TestPTYRunnerDisconnectsSlowObserverWithoutBlockingBroadcast(t *testing.T) {
+	runner := &PTYRunner{subscribers: make(map[uint64]*subscriber)}
+	sub := runner.subscribeBestEffort()
+
+	for i := 0; i < 129; i++ {
+		runner.broadcast("output")
+	}
+	if got := runner.subscriberCount(); got != 0 {
+		t.Fatalf("subscriber count = %d, want slow observer removed", got)
+	}
+	<-sub.done
+	if err := runner.subscriptionResultErr(sub); !errors.Is(err, errSubscriberTooSlow) {
+		t.Fatalf("subscription error = %v, want %v", err, errSubscriberTooSlow)
+	}
+}
+
+func TestPTYRunnerBackpressuresReliableSubscriberWithoutDroppingOutput(t *testing.T) {
+	runner := &PTYRunner{subscribers: make(map[uint64]*subscriber)}
+	sub := runner.subscribeReliable()
+	defer runner.unsubscribe(sub.id)
+
+	for i := 0; i < 128; i++ {
+		runner.broadcast("output")
+	}
+	broadcastDone := make(chan struct{})
+	go func() {
+		runner.broadcast("last")
+		close(broadcastDone)
+	}()
+	select {
+	case <-broadcastDone:
+		t.Fatal("reliable broadcast completed before queue space was available")
+	case <-time.After(20 * time.Millisecond):
+	}
+	if got := <-sub.ch; got != "output" {
+		t.Fatalf("first chunk = %q, want output", got)
+	}
+	select {
+	case <-broadcastDone:
+	case <-time.After(time.Second):
+		t.Fatal("reliable broadcast did not resume after queue space was available")
+	}
+	if got := runner.subscriberCount(); got != 1 {
+		t.Fatalf("subscriber count = %d, want reliable subscriber retained", got)
+	}
+}
+
 func TestWriteSubscriptionCleansSplitTerminalControls(t *testing.T) {
 	runner := &PTYRunner{}
 	ch := make(chan string, 3)
@@ -477,7 +746,7 @@ func TestWriteSubscriptionCleansSplitTerminalControls(t *testing.T) {
 	close(ch)
 
 	var out bytes.Buffer
-	if err := runner.writeSubscription(&out, ch, 0, nil); err != nil {
+	if err := runner.writeSubscription(&out, testSubscription(ch), 0, nil); err != nil {
 		t.Fatalf("writeSubscription returned error: %v", err)
 	}
 
@@ -496,7 +765,7 @@ func TestWriteSubscriptionAppliesCarriageReturnAcrossChunks(t *testing.T) {
 	close(ch)
 
 	var out bytes.Buffer
-	if err := runner.writeSubscription(&out, ch, 0, nil); err != nil {
+	if err := runner.writeSubscription(&out, testSubscription(ch), 0, nil); err != nil {
 		t.Fatalf("writeSubscription returned error: %v", err)
 	}
 
@@ -515,7 +784,7 @@ func TestWriteSubscriptionAppliesBackspaceAcrossChunks(t *testing.T) {
 	close(ch)
 
 	var out bytes.Buffer
-	if err := runner.writeSubscription(&out, ch, 0, nil); err != nil {
+	if err := runner.writeSubscription(&out, testSubscription(ch), 0, nil); err != nil {
 		t.Fatalf("writeSubscription returned error: %v", err)
 	}
 
@@ -534,7 +803,7 @@ func TestWriteSubscriptionFlushesPromptWithoutNewline(t *testing.T) {
 	var out safeBuffer
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- runner.writeSubscription(&out, ch, 0, done)
+		errCh <- runner.writeSubscription(&out, testSubscription(ch), 0, done)
 	}()
 	ch <- "Password: "
 	waitForOutput(t, &out, "Password: ")
@@ -543,6 +812,60 @@ func TestWriteSubscriptionFlushesPromptWithoutNewline(t *testing.T) {
 	if err := <-errCh; err != nil {
 		t.Fatalf("writeSubscription returned error: %v", err)
 	}
+}
+
+func TestWriteRawSubscriptionPreservesTerminalBytes(t *testing.T) {
+	runner := &PTYRunner{}
+	ch := make(chan string, 3)
+	chunks := []string{"\x1b]0;user@", "host:/path\x07\x1b[41m  ", "\x1b[0mabc\rxy\b\n"}
+	for _, chunk := range chunks {
+		ch <- chunk
+	}
+	close(ch)
+
+	var out bytes.Buffer
+	if err := runner.writeRawSubscription(&out, testSubscription(ch), nil); err != nil {
+		t.Fatalf("writeRawSubscription returned error: %v", err)
+	}
+	if got, want := out.String(), strings.Join(chunks, ""); got != want {
+		t.Fatalf("streamed output = %q, want %q", got, want)
+	}
+}
+
+func TestWriteRawSubscriptionReturnsWriterError(t *testing.T) {
+	runner := &PTYRunner{}
+	ch := make(chan string, 1)
+	ch <- "output"
+	close(ch)
+	writeErr := errors.New("write failed")
+
+	if err := runner.writeRawSubscription(failingWriter{err: writeErr}, testSubscription(ch), nil); !errors.Is(err, writeErr) {
+		t.Fatalf("writeRawSubscription error = %v, want %v", err, writeErr)
+	}
+}
+
+func TestWriteRawSubscriptionWritesPromptImmediately(t *testing.T) {
+	runner := &PTYRunner{}
+	ch := make(chan string, 1)
+	done := make(chan struct{})
+
+	var out safeBuffer
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- runner.writeRawSubscription(&out, testSubscription(ch), done)
+	}()
+	ch <- "Password: "
+	waitForOutput(t, &out, "Password: ")
+	close(done)
+	if err := <-errCh; err != nil {
+		t.Fatalf("writeRawSubscription returned error: %v", err)
+	}
+}
+
+func testSubscription(ch <-chan string) subscription {
+	errCh := make(chan error)
+	close(errCh)
+	return subscription{ch: ch, err: errCh}
 }
 
 func TestSkipPrefixWriterSkipsSplitDuplicatePrefix(t *testing.T) {

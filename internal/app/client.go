@@ -1,6 +1,8 @@
 package app
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,7 +25,24 @@ func DefaultSocketPath() string {
 	return filepath.Join(home, ".ptymux", "sockets", "ptymux-default.sock")
 }
 
-func Run(cfg Config) (server.Response, error) {
+func serverRequestFromConfig(cfg Config) server.Request {
+	return server.Request{
+		Action:     string(cfg.Action),
+		Session:    cfg.Session,
+		Pane:       cfg.Pane,
+		Tab:        cfg.Tab,
+		Command:    cfg.Command,
+		Follow:     cfg.Follow,
+		WaitMillis: int64(cfg.Wait / time.Millisecond),
+		ReadCount:  cfg.ReadCount,
+	}
+}
+
+func runLocal(cfg Config) (server.Response, error) {
+	return runLocalContext(context.Background(), cfg)
+}
+
+func runLocalContext(ctx context.Context, cfg Config) (server.Response, error) {
 	socketPath := cfg.Socket
 	if socketPath == "" {
 		socketPath = DefaultSocketPath()
@@ -39,35 +58,31 @@ func Run(cfg Config) (server.Response, error) {
 		}).Serve(socketPath)
 	}
 
-	req := server.Request{
-		Action:     string(cfg.Action),
-		Session:    cfg.Session,
-		Pane:       cfg.Pane,
-		Tab:        cfg.Tab,
-		Command:    cfg.Command,
-		Follow:     cfg.Follow,
-		WaitMillis: int64(cfg.Wait / time.Millisecond),
-		ReadCount:  cfg.ReadCount,
-	}
+	req := serverRequestFromConfig(cfg)
 
-	if cfg.Action == ActionFollow || cfg.Action == ActionCtrlC || (cfg.Action == ActionSend && cfg.Follow) || (cfg.Action == ActionCommand && cfg.Follow) || (cfg.Action == ActionKeys && cfg.Follow) {
-		if err := streamSend(socketPath, req, os.Stdout); err != nil {
+	if server.IsStreamRequest(req) {
+		if err := streamSendContext(ctx, socketPath, req, os.Stdout); err != nil {
+			var connectErr *daemonConnectError
+			if !errors.As(err, &connectErr) || ctx.Err() != nil {
+				return server.Response{}, err
+			}
 			if startErr := startDaemon(socketPath); startErr != nil {
 				return server.Response{}, fmt.Errorf("%v; also failed to start daemon: %w", err, startErr)
 			}
-			if err := streamSend(socketPath, req, os.Stdout); err != nil {
+			if err := streamSendContext(ctx, socketPath, req, os.Stdout); err != nil {
 				return server.Response{}, err
 			}
 		}
 		return server.Response{}, nil
 	}
 
-	resp, err := send(socketPath, req)
-	if err != nil && cfg.Action != ActionStop {
+	resp, err := sendContext(ctx, socketPath, req)
+	var connectErr *daemonConnectError
+	if err != nil && cfg.Action != ActionStop && errors.As(err, &connectErr) && ctx.Err() == nil {
 		if startErr := startDaemon(socketPath); startErr != nil {
 			return server.Response{}, fmt.Errorf("%v; also failed to start daemon: %w", err, startErr)
 		}
-		resp, err = send(socketPath, req)
+		resp, err = sendContext(ctx, socketPath, req)
 	}
 	if err != nil {
 		return server.Response{}, err
@@ -78,13 +93,146 @@ func Run(cfg Config) (server.Response, error) {
 	return resp, nil
 }
 
+type daemonConnectError struct {
+	socketPath string
+	err        error
+}
+
+func (e *daemonConnectError) Error() string {
+	return fmt.Sprintf("connect daemon at %s: %v", e.socketPath, e.err)
+}
+
+func (e *daemonConnectError) Unwrap() error {
+	return e.err
+}
+
+const localStreamNegotiationTimeout = 5 * time.Second
+
 func streamSend(socketPath string, req server.Request, output io.Writer) error {
-	conn, err := net.DialTimeout("unix", socketPath, time.Second)
+	return streamSendContext(context.Background(), socketPath, req, output)
+}
+
+func streamSendContext(ctx context.Context, socketPath string, req server.Request, output io.Writer) error {
+	return streamSendWithNegotiationTimeoutContext(ctx, socketPath, req, output, localStreamNegotiationTimeout)
+}
+
+func streamSendWithNegotiationTimeout(socketPath string, req server.Request, output io.Writer, negotiationTimeout time.Duration) error {
+	return streamSendWithNegotiationTimeoutContext(context.Background(), socketPath, req, output, negotiationTimeout)
+}
+
+func streamSendWithNegotiationTimeoutContext(ctx context.Context, socketPath string, req server.Request, output io.Writer, negotiationTimeout time.Duration) (returnErr error) {
+	conn, err := (&net.Dialer{Timeout: time.Second}).DialContext(ctx, "unix", socketPath)
 	if err != nil {
-		return fmt.Errorf("connect daemon at %s: %w", socketPath, err)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return &daemonConnectError{socketPath: socketPath, err: err}
 	}
 	defer conn.Close()
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCancel()
+	defer func() {
+		if ctx.Err() != nil {
+			returnErr = ctx.Err()
+		}
+	}()
+	if negotiationTimeout > 0 {
+		if err := conn.SetDeadline(time.Now().Add(negotiationTimeout)); err != nil {
+			return fmt.Errorf("set local stream negotiation deadline: %w", err)
+		}
+	}
 
+	envelope := req
+	envelope.Action = server.LocalStreamEnvelopeAction
+	envelope.StreamVersion = server.LocalStreamVersion
+	envelope.StreamAction = req.Action
+	if err := json.NewEncoder(conn).Encode(envelope); err != nil {
+		return err
+	}
+
+	reader := bufio.NewReader(conn)
+	prefix, err := reader.Peek(len(server.LocalStreamMagic))
+	if err != nil {
+		return fmt.Errorf("read local stream acknowledgement: %w", err)
+	}
+	if string(prefix) != server.LocalStreamMagic {
+		var response server.Response
+		if err := json.NewDecoder(reader).Decode(&response); err != nil {
+			return fmt.Errorf("decode local stream negotiation: %w", err)
+		}
+		expected := fmt.Sprintf("unknown action %q", server.LocalStreamEnvelopeAction)
+		if response.Error != expected {
+			if response.Error != "" {
+				return errors.New(response.Error)
+			}
+			return errors.New("daemon did not acknowledge local stream protocol")
+		}
+		_ = conn.Close()
+		return streamSendLegacyContext(ctx, socketPath, req, output)
+	}
+
+	started := false
+	for {
+		frameType, payload, err := server.ReadLocalStreamFrame(reader)
+		if err != nil {
+			return fmt.Errorf("read local stream frame: %w", err)
+		}
+		switch frameType {
+		case server.LocalStreamFrameStarted:
+			if started {
+				return errors.New("duplicate local stream acknowledgement")
+			}
+			if negotiationTimeout > 0 {
+				if err := conn.SetDeadline(time.Time{}); err != nil {
+					return fmt.Errorf("clear local stream negotiation deadline: %w", err)
+				}
+			}
+			started = true
+		case server.LocalStreamFrameData:
+			if !started {
+				return errors.New("local stream data arrived before acknowledgement")
+			}
+			n, err := output.Write(payload)
+			if err != nil {
+				return err
+			}
+			if n != len(payload) {
+				return io.ErrShortWrite
+			}
+		case server.LocalStreamFrameError:
+			if !started {
+				return errors.New("local stream error arrived before acknowledgement")
+			}
+			return errors.New(string(payload))
+		case server.LocalStreamFrameEnd:
+			if !started {
+				return errors.New("local stream ended before acknowledgement")
+			}
+			return nil
+		}
+	}
+}
+
+func streamSendLegacy(socketPath string, req server.Request, output io.Writer) error {
+	return streamSendLegacyContext(context.Background(), socketPath, req, output)
+}
+
+func streamSendLegacyContext(ctx context.Context, socketPath string, req server.Request, output io.Writer) (returnErr error) {
+	conn, err := (&net.Dialer{Timeout: time.Second}).DialContext(ctx, "unix", socketPath)
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("legacy stream fallback could not connect daemon at %s: %v", socketPath, err)
+	}
+	defer conn.Close()
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCancel()
+	defer func() {
+		if ctx.Err() != nil {
+			returnErr = ctx.Err()
+		}
+	}()
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
 		return err
 	}
@@ -121,17 +269,37 @@ func startDaemon(socketPath string) error {
 }
 
 func send(socketPath string, req server.Request) (server.Response, error) {
-	conn, err := net.DialTimeout("unix", socketPath, time.Second)
+	return sendContext(context.Background(), socketPath, req)
+}
+
+func sendContext(ctx context.Context, socketPath string, req server.Request) (resp server.Response, returnErr error) {
+	conn, err := (&net.Dialer{Timeout: time.Second}).DialContext(ctx, "unix", socketPath)
 	if err != nil {
-		return server.Response{}, fmt.Errorf("connect daemon at %s: %w", socketPath, err)
+		if ctx.Err() != nil {
+			return server.Response{}, ctx.Err()
+		}
+		return server.Response{}, &daemonConnectError{socketPath: socketPath, err: err}
 	}
 	defer conn.Close()
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCancel()
+	defer func() {
+		if ctx.Err() != nil {
+			resp = server.Response{}
+			returnErr = ctx.Err()
+		}
+	}()
 
+	if err := conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return server.Response{}, err
+	}
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
 		return server.Response{}, err
 	}
+	if err := conn.SetWriteDeadline(time.Time{}); err != nil {
+		return server.Response{}, err
+	}
 
-	var resp server.Response
 	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
 		return server.Response{}, err
 	}
