@@ -26,17 +26,19 @@ var (
 	ErrAuthenticationFailed  = errors.New("authentication_failed")
 	ErrClientNameUnavailable = errors.New("remote: client name unavailable")
 	ErrInvalidClientName     = errors.New("remote: invalid client name")
+	ErrRegistryClosed        = errors.New("remote: registry closed")
 
-	errRegistryClosed = errors.New("remote: registry closed")
-	dummyDigest       = sha256.Sum256([]byte("ptymux remote registry dummy credential"))
+	dummyDigest = sha256.Sum256([]byte("ptymux remote registry dummy credential"))
 )
 
 type ClientStatus string
 
 const (
+	StatusPending ClientStatus = "pending"
 	StatusActive  ClientStatus = "active"
 	StatusRevoked ClientStatus = "revoked"
 
+	ClientPending = StatusPending
 	ClientActive  = StatusActive
 	ClientRevoked = StatusRevoked
 )
@@ -153,9 +155,9 @@ func (r *Registry) Register(name string) (ClientRecord, string, error) {
 	r.mu.RLock()
 	if r.closed {
 		r.mu.RUnlock()
-		return ClientRecord{}, "", errRegistryClosed
+		return ClientRecord{}, "", ErrRegistryClosed
 	}
-	if existing, ok := r.clients[name]; ok && existing.Status == ClientActive {
+	if existing, ok := r.clients[name]; ok && existing.Status != ClientRevoked {
 		r.mu.RUnlock()
 		return ClientRecord{}, "", ErrClientNameUnavailable
 	}
@@ -191,11 +193,116 @@ func (r *Registry) Register(name string) (ClientRecord, string, error) {
 	return record, password, nil
 }
 
+// PrepareRegistration creates recoverable pending credentials. Supplying the
+// password from an earlier preparation recovers that pending registration.
+// Passing an empty password explicitly replaces pending credentials while
+// preserving their owner identity.
+func (r *Registry) PrepareRegistration(name, password string) (ClientRecord, string, error) {
+	if !ValidClientName(name) {
+		return ClientRecord{}, "", ErrInvalidClientName
+	}
+
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
+
+	r.mu.RLock()
+	if r.closed {
+		r.mu.RUnlock()
+		return ClientRecord{}, "", ErrRegistryClosed
+	}
+	existing, exists := r.clients[name]
+	if exists && existing.Status == ClientActive {
+		r.mu.RUnlock()
+		return ClientRecord{}, "", ErrClientNameUnavailable
+	}
+	if password != "" {
+		valid := credentialMatches(existing.PasswordSHA256, password, exists && existing.Status == ClientPending)
+		r.mu.RUnlock()
+		if !valid {
+			return ClientRecord{}, "", ErrAuthenticationFailed
+		}
+		return publicRecord(existing), password, nil
+	}
+	clients := cloneClients(r.clients)
+	r.mu.RUnlock()
+
+	ownerID := ""
+	createdAt := time.Time{}
+	if exists && existing.Status == ClientPending {
+		ownerID = existing.OwnerID
+		createdAt = existing.CreatedAt
+	} else {
+		var err error
+		ownerID, err = randomToken(16)
+		if err != nil {
+			return ClientRecord{}, "", fmt.Errorf("remote: generate owner ID: %w", err)
+		}
+	}
+	freshPassword, err := randomToken(32)
+	if err != nil {
+		return ClientRecord{}, "", fmt.Errorf("remote: generate password: %w", err)
+	}
+	now := time.Now().UTC()
+	if createdAt.IsZero() {
+		createdAt = now
+	}
+	client := storedClient{
+		OwnerID:              ownerID,
+		Name:                 name,
+		PasswordSHA256:       digestString(freshPassword),
+		CredentialGeneration: 1,
+		Status:               ClientPending,
+		CreatedAt:            createdAt,
+		UpdatedAt:            now,
+	}
+	clients[name] = client
+	record := publicRecord(client)
+	if err := r.persistAndPublish(clients); err != nil {
+		if registryMutationCommitted(err) {
+			return record, freshPassword, err
+		}
+		return ClientRecord{}, "", err
+	}
+	return record, freshPassword, nil
+}
+
+// CommitRegistration activates credentials prepared for name.
+func (r *Registry) CommitRegistration(name, password string) (Principal, error) {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
+
+	r.mu.RLock()
+	if r.closed {
+		r.mu.RUnlock()
+		return Principal{}, ErrRegistryClosed
+	}
+	client, exists := r.clients[name]
+	valid := credentialMatches(client.PasswordSHA256, password, exists && client.Status == ClientPending && ValidClientName(name))
+	if !valid {
+		r.mu.RUnlock()
+		return Principal{}, ErrAuthenticationFailed
+	}
+	clients := cloneClients(r.clients)
+	r.mu.RUnlock()
+
+	client.Status = ClientActive
+	client.UpdatedAt = time.Now().UTC()
+	clients[name] = client
+	principal := principalFor(client)
+	if err := r.persistAndPublish(clients); err != nil {
+		if registryMutationCommitted(err) {
+			return principal, err
+		}
+		return Principal{}, err
+	}
+	return principal, nil
+}
+
 func (r *Registry) Authenticate(name, password string) (Principal, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	if r.closed {
-		return Principal{}, errRegistryClosed
+		return Principal{}, ErrRegistryClosed
 	}
 	return r.authenticateLocked(name, password)
 }
@@ -207,7 +314,7 @@ func (r *Registry) Rotate(name, currentPassword string) (string, Principal, erro
 	r.mu.RLock()
 	if r.closed {
 		r.mu.RUnlock()
-		return "", Principal{}, errRegistryClosed
+		return "", Principal{}, ErrRegistryClosed
 	}
 	principal, err := r.authenticateLocked(name, currentPassword)
 	if err != nil {
@@ -243,7 +350,7 @@ func (r *Registry) Revoke(name, currentPassword string) error {
 	r.mu.RLock()
 	if r.closed {
 		r.mu.RUnlock()
-		return errRegistryClosed
+		return ErrRegistryClosed
 	}
 	if _, err := r.authenticateLocked(name, currentPassword); err != nil {
 		r.mu.RUnlock()
@@ -285,23 +392,26 @@ func (r *Registry) Close() error {
 }
 
 func (r *Registry) authenticateLocked(name, password string) (Principal, error) {
+	client, exists := r.clients[name]
+	valid := credentialMatches(client.PasswordSHA256, password, exists && client.Status == ClientActive && ValidClientName(name))
+	if !valid {
+		return Principal{}, ErrAuthenticationFailed
+	}
+	return principalFor(client), nil
+}
+
+func credentialMatches(encodedDigest, password string, valid bool) bool {
 	actual := sha256.Sum256([]byte(password))
 	expected := dummyDigest[:]
-	client, exists := r.clients[name]
-	valid := exists && client.Status == ClientActive && ValidClientName(name)
 	if valid {
-		decoded, err := base64.RawURLEncoding.DecodeString(client.PasswordSHA256)
+		decoded, err := base64.RawURLEncoding.DecodeString(encodedDigest)
 		if err == nil && len(decoded) == sha256.Size {
 			expected = decoded
 		} else {
 			valid = false
 		}
 	}
-	matched := subtle.ConstantTimeCompare(actual[:], expected)
-	if !valid || matched != 1 {
-		return Principal{}, ErrAuthenticationFailed
-	}
-	return principalFor(client), nil
+	return subtle.ConstantTimeCompare(actual[:], expected) == 1 && valid
 }
 
 func (r *Registry) load() error {
@@ -524,6 +634,10 @@ func validateStoredClient(client storedClient) error {
 		return errors.New("invalid timestamps")
 	}
 	switch client.Status {
+	case ClientPending:
+		if client.RevokedAt != nil {
+			return errors.New("pending client has revocation timestamp")
+		}
 	case ClientActive:
 		if client.RevokedAt != nil {
 			return errors.New("active client has revocation timestamp")

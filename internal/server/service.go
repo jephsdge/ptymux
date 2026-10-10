@@ -38,6 +38,10 @@ func newServiceWithRunnerFactory(factory func() (Runner, error)) *Service {
 	return &Service{store: NewStore(), runnerFactory: factory}
 }
 
+func errorResponse(err error) Response {
+	return Response{Error: err.Error(), Err: err}
+}
+
 func (s *Service) Store() *Store {
 	return s.store
 }
@@ -45,11 +49,11 @@ func (s *Service) Store() *Store {
 func (s *Service) Create(req Request) Response {
 	done, err := s.beginOperation()
 	if err != nil {
-		return Response{Error: err.Error()}
+		return errorResponse(err)
 	}
 	defer done()
 	if err := ValidateCompleteTarget(req.Session, req.Pane, req.Tab); err != nil {
-		return Response{Error: err.Error()}
+		return errorResponse(err)
 	}
 	return s.create(req)
 }
@@ -57,10 +61,10 @@ func (s *Service) Create(req Request) Response {
 func (s *Service) create(req Request) Response {
 	tab, done, err := s.beginTargetUse(req, true)
 	if err != nil {
-		return Response{Error: err.Error()}
+		return errorResponse(err)
 	}
 	if tab == nil {
-		return Response{Error: ErrTargetNotFound.Error()}
+		return errorResponse(ErrTargetNotFound)
 	}
 	done()
 	return Response{}
@@ -73,11 +77,11 @@ func (s *Service) Handle(req Request, createMissing bool) Response {
 func (s *Service) HandleWithDone(req Request, createMissing bool, clientDone <-chan struct{}) Response {
 	operationDone, err := s.beginOperation()
 	if err != nil {
-		return Response{Error: err.Error()}
+		return errorResponse(err)
 	}
 	defer operationDone()
 	if err := ValidateRequest(req); err != nil {
-		return Response{Error: err.Error()}
+		return errorResponse(err)
 	}
 
 	switch req.Action {
@@ -86,24 +90,24 @@ func (s *Service) HandleWithDone(req Request, createMissing bool, clientDone <-c
 	case "run":
 		tab, finish, err := s.beginTargetUse(req, createMissing)
 		if err != nil {
-			return Response{Error: err.Error()}
+			return errorResponse(err)
 		}
 		if tab == nil {
-			return Response{Error: ErrTargetNotFound.Error()}
+			return errorResponse(ErrTargetNotFound)
 		}
 		defer finish()
 		result, err := runWithDone(tab.Runner, req.Command, clientDone)
 		if err != nil {
-			return Response{Error: err.Error()}
+			return errorResponse(err)
 		}
 		return Response{Output: result.Output, ExitCode: result.ExitCode, Truncated: result.Truncated}
 	case "idle":
 		tab, finish, err := s.beginTargetUse(req, createMissing)
 		if err != nil {
-			return Response{Error: err.Error()}
+			return errorResponse(err)
 		}
 		if tab == nil {
-			return Response{Error: ErrTargetNotFound.Error()}
+			return errorResponse(ErrTargetNotFound)
 		}
 		defer finish()
 		wait := time.Duration(req.WaitMillis) * time.Millisecond
@@ -112,94 +116,94 @@ func (s *Service) HandleWithDone(req Request, createMissing bool, clientDone <-c
 		}
 		result, err := tab.Runner.SendWait(req.Command, wait)
 		if err != nil {
-			return Response{Error: err.Error()}
+			return errorResponse(err)
 		}
 		return Response{Output: result.Output, ExitCode: result.ExitCode, Truncated: result.Truncated}
 	case "send":
 		tab, finish, err := s.beginTargetUse(req, createMissing)
 		if err != nil {
-			return Response{Error: err.Error()}
+			return errorResponse(err)
 		}
 		if tab == nil {
-			return Response{Error: ErrTargetNotFound.Error()}
+			return errorResponse(ErrTargetNotFound)
 		}
 		defer finish()
 		if req.WaitMillis > 0 {
 			result, err := tab.Runner.SendWait(req.Command, time.Duration(req.WaitMillis)*time.Millisecond)
 			if err != nil {
-				return Response{Error: err.Error()}
+				return errorResponse(err)
 			}
 			return Response{Output: result.Output, ExitCode: result.ExitCode, Truncated: result.Truncated}
 		}
 		if err := tab.Runner.Send(req.Command); err != nil {
-			return Response{Error: err.Error()}
+			return errorResponse(err)
 		}
 		return Response{}
 	case "text":
 		tab, finish, err := s.beginTargetUse(req, createMissing)
 		if err != nil {
-			return Response{Error: err.Error()}
+			return errorResponse(err)
 		}
 		if tab == nil {
-			return Response{Error: ErrTargetNotFound.Error()}
+			return errorResponse(ErrTargetNotFound)
 		}
 		defer finish()
 		if err := tab.Runner.Text(req.Command); err != nil {
-			return Response{Error: err.Error()}
+			return errorResponse(err)
 		}
 		return Response{}
 	case "command":
 		tab, finish, err := s.beginTargetUse(req, createMissing)
 		if err != nil {
-			return Response{Error: err.Error()}
+			return errorResponse(err)
 		}
 		if tab == nil {
-			return Response{Error: ErrTargetNotFound.Error()}
+			return errorResponse(ErrTargetNotFound)
 		}
 		defer finish()
 		if req.WaitMillis > 0 {
 			result, err := tab.Runner.CommandWait(req.Command, time.Duration(req.WaitMillis)*time.Millisecond)
 			if err != nil {
-				return Response{Error: err.Error()}
+				return errorResponse(err)
 			}
 			return Response{Output: result.Output, ExitCode: result.ExitCode, Truncated: result.Truncated}
 		}
 		if err := tab.Runner.Command(req.Command); err != nil {
-			return Response{Error: err.Error()}
+			return errorResponse(err)
 		}
 		return Response{}
 	case "keys":
 		tab, finish, err := s.beginTargetUse(req, createMissing)
 		if err != nil {
-			return Response{Error: err.Error()}
+			return errorResponse(err)
 		}
 		if tab == nil {
-			return Response{Error: ErrTargetNotFound.Error()}
+			return errorResponse(ErrTargetNotFound)
 		}
 		defer finish()
 		if req.WaitMillis > 0 {
 			result, err := tab.Runner.KeysWait(req.Command, time.Duration(req.WaitMillis)*time.Millisecond)
 			if err != nil {
-				return Response{Error: err.Error()}
+				return errorResponse(err)
 			}
 			return Response{Output: result.Output, ExitCode: result.ExitCode, Truncated: result.Truncated}
 		}
 		if err := tab.Runner.Keys(req.Command); err != nil {
-			return Response{Error: err.Error()}
+			return errorResponse(err)
 		}
 		return Response{}
 	case "read":
 		tab, finish, err := s.beginTargetUse(req, createMissing)
 		if err != nil {
-			return Response{Error: err.Error()}
+			return errorResponse(err)
 		}
 		if tab == nil {
-			return Response{Error: ErrTargetNotFound.Error()}
+			return errorResponse(ErrTargetNotFound)
 		}
 		defer finish()
 		result, err := tab.Runner.Read(req.ReadCount)
 		if err != nil {
-			return Response{Error: err.Error()}
+			return errorResponse(err)
 		}
 		return Response{Output: result.Output, ExitCode: result.ExitCode, Truncated: result.Truncated}
 	case "list":
@@ -215,11 +219,11 @@ func (s *Service) HandleWithDone(req Request, createMissing bool, clientDone <-c
 			err = s.store.CloseTarget(req.Session, req.Pane, req.Tab)
 		}
 		if err != nil {
-			return Response{Error: err.Error()}
+			return errorResponse(err)
 		}
 		return Response{}
 	default:
-		return Response{Error: fmt.Sprintf("unknown action %q", req.Action)}
+		return errorResponse(fmt.Errorf("unknown action %q", req.Action))
 	}
 }
 
@@ -277,18 +281,18 @@ func (s *Service) Stream(req Request, output io.Writer, done <-chan struct{}, cr
 func (s *Service) CloseExisting(req Request) Response {
 	done, err := s.beginOperation()
 	if err != nil {
-		return Response{Error: err.Error()}
+		return errorResponse(err)
 	}
 	defer done()
 	if err := ValidateCompleteTarget(req.Session, req.Pane, req.Tab); err != nil {
-		return Response{Error: err.Error()}
+		return errorResponse(err)
 	}
 	found, err := s.store.CloseExistingTarget(req.Session, req.Pane, req.Tab)
 	if err != nil {
-		return Response{Error: err.Error()}
+		return errorResponse(err)
 	}
 	if !found {
-		return Response{Error: ErrTargetNotFound.Error()}
+		return errorResponse(ErrTargetNotFound)
 	}
 	return Response{}
 }

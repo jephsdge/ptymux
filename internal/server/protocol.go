@@ -37,6 +37,7 @@ type Response struct {
 	Truncated bool     `json:"truncated,omitempty"`
 	Snapshot  Snapshot `json:"snapshot,omitempty"`
 	Error     string   `json:"error,omitempty"`
+	Err       error    `json:"-"`
 }
 
 type RunResult struct {

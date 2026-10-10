@@ -168,6 +168,42 @@ func TestRegistryCommittedMutationErrorsReturnUsableResults(t *testing.T) {
 		}
 	})
 
+	t.Run("prepare registration", func(t *testing.T) {
+		registry := openTestRegistry(t)
+		registry.syncDirectory = func(string) error { return syncErr }
+		record, password, err := registry.PrepareRegistration("alice", "")
+		if !errors.Is(err, syncErr) || !registryMutationCommitted(err) {
+			t.Fatalf("PrepareRegistration error = %v, want committed directory sync failure", err)
+		}
+		if record.Status != ClientPending || password == "" {
+			t.Fatalf("PrepareRegistration result = %+v/%q, want usable pending credentials", record, password)
+		}
+		if recovered, recoveredPassword, err := registry.PrepareRegistration(record.Name, password); err != nil {
+			t.Fatal(err)
+		} else if recovered.OwnerID != record.OwnerID || recoveredPassword != password {
+			t.Fatalf("recovered registration = %+v/%q", recovered, recoveredPassword)
+		}
+	})
+
+	t.Run("commit registration", func(t *testing.T) {
+		registry := openTestRegistry(t)
+		record, password, err := registry.PrepareRegistration("alice", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		registry.syncDirectory = func(string) error { return syncErr }
+		principal, err := registry.CommitRegistration(record.Name, password)
+		if !errors.Is(err, syncErr) || !registryMutationCommitted(err) {
+			t.Fatalf("CommitRegistration error = %v, want committed directory sync failure", err)
+		}
+		if principal.OwnerID != record.OwnerID {
+			t.Fatalf("CommitRegistration principal = %+v, want owner %q", principal, record.OwnerID)
+		}
+		if _, err := registry.Authenticate(record.Name, password); err != nil {
+			t.Fatal(err)
+		}
+	})
+
 	t.Run("rotate", func(t *testing.T) {
 		registry := openTestRegistry(t)
 		record, oldPassword, err := registry.Register("alice")
@@ -691,6 +727,131 @@ func TestOpenRegistryRejectsCorruptClientRecords(t *testing.T) {
 				t.Fatal("OpenRegistry accepted corrupt client data")
 			}
 		})
+	}
+}
+
+func TestPendingRegistrationPersistsAndRecoversAcrossReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state", "registry.json")
+	registry, err := OpenRegistry(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, password, err := registry.PrepareRegistration("pending", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != ClientPending || record.OwnerID == "" || password == "" {
+		t.Fatalf("prepared registration = %+v/%q", record, password)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte(password)) {
+		t.Fatal("registry contains pending plaintext password")
+	}
+	if _, err := registry.Authenticate(record.Name, password); !errors.Is(err, ErrAuthenticationFailed) {
+		t.Fatalf("pending Authenticate error = %v, want ErrAuthenticationFailed", err)
+	}
+	if err := registry.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	registry, err = OpenRegistry(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer registry.Close()
+	recovered, recoveredPassword, err := registry.PrepareRegistration(record.Name, password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered != record || recoveredPassword != password {
+		t.Fatalf("recovered registration = %+v/%q, want %+v/%q", recovered, recoveredPassword, record, password)
+	}
+	principal, err := registry.CommitRegistration(record.Name, password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if principal.OwnerID != record.OwnerID || principal.CredentialGeneration != 1 {
+		t.Fatalf("committed principal = %+v", principal)
+	}
+	if authenticated, err := registry.Authenticate(record.Name, password); err != nil {
+		t.Fatal(err)
+	} else if authenticated != principal {
+		t.Fatalf("authenticated principal = %+v, want %+v", authenticated, principal)
+	}
+}
+
+func TestPendingRegistrationReplacementPreservesOwnerAndReplacesPassword(t *testing.T) {
+	registry := openTestRegistry(t)
+	first, firstPassword, err := registry.PrepareRegistration("replace", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, secondPassword, err := registry.PrepareRegistration("replace", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.OwnerID != first.OwnerID {
+		t.Fatalf("replacement owner = %q, want %q", second.OwnerID, first.OwnerID)
+	}
+	if secondPassword == firstPassword {
+		t.Fatal("replacement reused the pending password")
+	}
+	if _, _, err := registry.PrepareRegistration("replace", firstPassword); !errors.Is(err, ErrAuthenticationFailed) {
+		t.Fatalf("recovery with replaced password error = %v, want ErrAuthenticationFailed", err)
+	}
+	if _, err := registry.CommitRegistration("replace", firstPassword); !errors.Is(err, ErrAuthenticationFailed) {
+		t.Fatalf("commit with replaced password error = %v, want ErrAuthenticationFailed", err)
+	}
+	if _, err := registry.CommitRegistration("replace", secondPassword); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPendingRegistrationProtectsActiveNamesAndExistingRegister(t *testing.T) {
+	registry := openTestRegistry(t)
+	pending, password, err := registry.PrepareRegistration("reserved", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := registry.Register(pending.Name); !errors.Is(err, ErrClientNameUnavailable) {
+		t.Fatalf("Register pending name error = %v, want ErrClientNameUnavailable", err)
+	}
+	if _, err := registry.CommitRegistration(pending.Name, password); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := registry.PrepareRegistration(pending.Name, ""); !errors.Is(err, ErrClientNameUnavailable) {
+		t.Fatalf("PrepareRegistration active name error = %v, want ErrClientNameUnavailable", err)
+	}
+	if _, _, err := registry.PrepareRegistration(pending.Name, password); !errors.Is(err, ErrClientNameUnavailable) {
+		t.Fatalf("recover active name error = %v, want ErrClientNameUnavailable", err)
+	}
+}
+
+func TestImmediateRegistrationCompatibilityWithPendingRecords(t *testing.T) {
+	registry := openTestRegistry(t)
+	active, activePassword, err := registry.Register("immediate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active.Status != ClientActive {
+		t.Fatalf("immediate status = %q, want active", active.Status)
+	}
+	if _, err := registry.Authenticate(active.Name, activePassword); err != nil {
+		t.Fatal(err)
+	}
+
+	pending, pendingPassword, err := registry.PrepareRegistration("staged", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := registry.Rotate(pending.Name, pendingPassword); !errors.Is(err, ErrAuthenticationFailed) {
+		t.Fatalf("Rotate pending error = %v, want ErrAuthenticationFailed", err)
+	}
+	if err := registry.Revoke(pending.Name, pendingPassword); !errors.Is(err, ErrAuthenticationFailed) {
+		t.Fatalf("Revoke pending error = %v, want ErrAuthenticationFailed", err)
 	}
 }
 
